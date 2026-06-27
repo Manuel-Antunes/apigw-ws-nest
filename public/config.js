@@ -1,0 +1,1 @@
+window.__WS_URL__="wss://4s5b1299lc.execute-api.us-east-1.amazonaws.com/$default";

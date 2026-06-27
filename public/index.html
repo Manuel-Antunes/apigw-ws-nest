@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>socket monitor · apigw-ws</title>
+<style>
+  :root{
+    --ink:#0b1014;          /* background */
+    --panel:#10171d;        /* raised surface */
+    --line:#1d2932;         /* hairlines */
+    --muted:#5d7080;        /* system text */
+    --text:#c7d6df;         /* primary text */
+    --inbound:#46e0c8;      /* you -> server (phosphor) */
+    --outbound:#f0a23c;     /* server -> you (push/ack) */
+    --live:#46e0c8;
+    --dead:#3a4852;
+    --mono: ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans: system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:var(--ink); color:var(--text); font-family:var(--sans);
+    font-size:14px; line-height:1.5;
+    display:grid; grid-template-rows:auto 1fr; min-height:100%;
+  }
+
+  /* ---- header / live wire signature ------------------------------------ */
+  header{
+    border-bottom:1px solid var(--line); padding:18px 22px;
+    display:flex; align-items:center; gap:18px; flex-wrap:wrap;
+  }
+  .brand{font-family:var(--mono); letter-spacing:.04em; font-size:13px; color:var(--muted)}
+  .brand b{color:var(--text); font-weight:600}
+  .wire{flex:1; min-width:120px; height:2px; background:var(--dead); position:relative; border-radius:2px; overflow:hidden}
+  .wire.live{background:linear-gradient(90deg,transparent,var(--live),transparent); background-size:200% 100%; animation:flow 1.6s linear infinite}
+  @keyframes flow{from{background-position:200% 0}to{background-position:-200% 0}}
+  .status{font-family:var(--mono); font-size:12px; display:flex; align-items:center; gap:8px; white-space:nowrap}
+  .dot{width:9px; height:9px; border-radius:50%; background:var(--dead)}
+  .dot.live{background:var(--live); box-shadow:0 0 0 0 var(--live); animation:pulse 2s ease-out infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(70,224,200,.5)}100%{box-shadow:0 0 0 8px rgba(70,224,200,0)}}
+  .cid{color:var(--muted)}
+
+  /* ---- body grid ------------------------------------------------------- */
+  main{display:grid; grid-template-columns:300px 1fr; min-height:0}
+  @media (max-width:760px){ main{grid-template-columns:1fr; grid-template-rows:auto 1fr} }
+
+  .controls{border-right:1px solid var(--line); padding:22px; display:flex; flex-direction:column; gap:22px; overflow:auto}
+  @media (max-width:760px){ .controls{border-right:0; border-bottom:1px solid var(--line)} }
+
+  .group{display:flex; flex-direction:column; gap:9px}
+  .eyebrow{font-family:var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted)}
+  label{font-family:var(--mono); font-size:11px; color:var(--muted)}
+  input{
+    width:100%; background:var(--ink); border:1px solid var(--line); color:var(--text);
+    font-family:var(--mono); font-size:13px; padding:9px 11px; border-radius:6px;
+  }
+  input:focus-visible{outline:2px solid var(--inbound); outline-offset:1px; border-color:transparent}
+  button{
+    font-family:var(--mono); font-size:13px; text-align:left;
+    background:var(--panel); color:var(--text); border:1px solid var(--line);
+    padding:10px 12px; border-radius:6px; cursor:pointer; transition:border-color .12s, color .12s;
+  }
+  button:hover:not(:disabled){border-color:var(--inbound); color:var(--inbound)}
+  button:focus-visible{outline:2px solid var(--inbound); outline-offset:1px}
+  button:disabled{opacity:.4; cursor:not-allowed}
+  button .k{color:var(--muted)} /* the frame name hint */
+  .connect{background:var(--inbound); color:#04100c; border-color:var(--inbound); font-weight:600}
+  .connect:hover:not(:disabled){color:#04100c; filter:brightness(1.06)}
+  .connect.on{background:transparent; color:var(--outbound); border-color:var(--outbound)}
+  .connect.on:hover:not(:disabled){color:var(--outbound)}
+
+  /* ---- frame log (the signature) --------------------------------------- */
+  .log{min-height:0; display:flex; flex-direction:column}
+  .logbar{padding:11px 22px; border-bottom:1px solid var(--line); display:flex; gap:18px; align-items:center; font-family:var(--mono); font-size:11px; color:var(--muted)}
+  .legend{display:flex; gap:14px}
+  .legend span{display:flex; gap:6px; align-items:center}
+  .arrow{font-weight:700}
+  .in .arrow{color:var(--inbound)} .out .arrow{color:var(--outbound)}
+  .clear{margin-left:auto; background:none; border:0; color:var(--muted); cursor:pointer; font-family:var(--mono); font-size:11px; padding:2px 4px}
+  .clear:hover{color:var(--text)}
+  .frames{overflow:auto; padding:8px 0; font-family:var(--mono); font-size:12.5px; flex:1}
+  .frame{display:grid; grid-template-columns:84px 18px 1fr; gap:10px; padding:5px 22px; border-bottom:1px solid rgba(29,41,50,.5)}
+  .frame .t{color:var(--muted)}
+  .frame.in .arrow{color:var(--inbound)} .frame.out .arrow{color:var(--outbound)}
+  .frame .ev{color:var(--text)} .frame.in .ev{color:var(--inbound)} .frame.out .ev{color:var(--outbound)}
+  .frame .payload{color:var(--muted); white-space:pre-wrap; word-break:break-word}
+  .frame.sys{grid-template-columns:84px 1fr}
+  .frame.sys .msg{color:var(--muted); font-style:italic}
+  .empty{padding:40px 22px; color:var(--muted); font-family:var(--mono); font-size:12px}
+
+  @media (prefers-reduced-motion:reduce){
+    .wire.live{animation:none; background:var(--live)}
+    .dot.live{animation:none}
+  }
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand"><b>socket monitor</b> · apigw-ws</div>
+    <div class="wire" id="wire"></div>
+    <div class="status">
+      <span class="dot" id="dot"></span>
+      <span id="state">offline</span>
+      <span class="cid" id="cid"></span>
+    </div>
+  </header>
+
+  <main>
+    <section class="controls">
+      <div class="group">
+        <div class="eyebrow">connection</div>
+        <button class="connect" id="connectBtn">connect</button>
+      </div>
+
+      <div class="group">
+        <div class="eyebrow">feed</div>
+        <button id="subBtn" disabled>subscribe to feed <span class="k">· post.subscribe</span></button>
+        <button id="listBtn" disabled>request list <span class="k">· post.list</span></button>
+      </div>
+
+      <div class="group">
+        <div class="eyebrow">publish a post</div>
+        <label for="title">title</label>
+        <input id="title" value="Hello" />
+        <label for="body">body</label>
+        <input id="body" value="first post" />
+        <button id="createBtn" disabled>publish post <span class="k">· post.create</span></button>
+      </div>
+    </section>
+
+    <section class="log">
+      <div class="logbar">
+        <div class="legend">
+          <span class="in"><span class="arrow">▸</span> sent</span>
+          <span class="out"><span class="arrow">◂</span> received</span>
+        </div>
+        <button class="clear" id="clearBtn">clear</button>
+      </div>
+      <div class="frames" id="frames">
+        <div class="empty" id="empty">no frames yet — connect to begin</div>
+      </div>
+    </section>
+  </main>
+
+<!-- Injected at deploy by the StaticSite build: sets window.__WS_URL__ to the
+     API Gateway wss:// URL. Served empty by the local emulator. -->
+<script src="config.js"></script>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const frames = $('frames'), empty = $('empty');
+  let ws = null;
+
+  // AWS: the WebSocket lives at the API Gateway URL (different host from the
+  // CloudFront-served site). Local: fall back to this same host.
+  const WS_URL = window.__WS_URL__ ||
+    ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
+
+  const ts = () => new Date().toTimeString().slice(0,8);
+
+  function row(dir, ev, payload){
+    if (empty) { empty.remove(); }
+    const el = document.createElement('div');
+    if (dir === 'sys'){
+      el.className = 'frame sys';
+      el.innerHTML = `<span class="t">${ts()}</span><span class="msg"></span>`;
+      el.querySelector('.msg').textContent = ev;
+    } else {
+      el.className = 'frame ' + dir;
+      el.innerHTML = `<span class="t">${ts()}</span><span class="arrow">${dir==='in'?'▸':'◂'}</span>`
+        + `<span><span class="ev"></span> <span class="payload"></span></span>`;
+      el.querySelector('.ev').textContent = ev;
+      el.querySelector('.payload').textContent = payload ? JSON.stringify(payload) : '';
+    }
+    frames.appendChild(el);
+    frames.scrollTop = frames.scrollHeight;
+  }
+
+  function setLive(live, cid){
+    $('dot').classList.toggle('live', live);
+    $('wire').classList.toggle('live', live);
+    $('state').textContent = live ? 'connected' : 'offline';
+    $('cid').textContent = cid ? '· ' + cid.slice(0,8) : '';
+    for (const id of ['subBtn','listBtn','createBtn']) $(id).disabled = !live;
+    const b = $('connectBtn');
+    b.textContent = live ? 'disconnect' : 'connect';
+    b.classList.toggle('on', live);
+  }
+
+  function send(event, data){
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const frame = { event, data: data || {} };
+    ws.send(JSON.stringify(frame));
+    row('in', event, data || {});
+  }
+
+  $('connectBtn').onclick = () => {
+    if (ws){ ws.close(); return; }
+    row('sys', 'opening ' + WS_URL);
+    ws = new WebSocket(WS_URL);
+
+    // API Gateway doesn't push a hello frame, so go live on open. The local
+    // emulator additionally sends $connected with the connectionId (below).
+    ws.onopen = () => { row('sys', 'socket open'); setLive(true); };
+    ws.onclose = () => { row('sys', 'socket closed'); setLive(false); ws = null; };
+    ws.onerror = () => row('sys', 'socket error');
+    ws.onmessage = (e) => {
+      let msg; try { msg = JSON.parse(e.data); } catch { row('sys', 'non-json: ' + e.data); return; }
+      if (msg.event === '$connected'){ setLive(true, msg.data.connectionId); }
+      row('out', msg.event, msg.data);
+    };
+  };
+
+  $('subBtn').onclick  = () => send('post.subscribe');
+  $('listBtn').onclick = () => send('post.list');
+  $('createBtn').onclick = () => send('post.create', { title: $('title').value, body: $('body').value });
+  $('clearBtn').onclick = () => { frames.innerHTML = ''; };
+</script>
+</body>
+</html>
