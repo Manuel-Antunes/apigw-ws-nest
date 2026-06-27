@@ -10,4 +10,7 @@ export class PostService {
   list() {
     return this.repo.list();
   }
+  remove(id: string) {
+    return this.repo.remove(id);
+  }
 }

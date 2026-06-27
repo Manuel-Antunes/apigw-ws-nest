@@ -69,7 +69,8 @@ export interface ApiGwResponse {
   body?: string;
 }
 
-/** Parsed inbound frame coming from a client. */
+/** Parsed inbound frame coming from a client. Structurally identical to NestJS's
+ *  WsResponse — gateways type their acks/streams with WsResponse directly. */
 export interface ClientFrame {
   event: string;
   data: any;

@@ -74,7 +74,7 @@ export default $config({
       POSTS_TABLE: posts.name,
     };
     const route = {
-      handler: 'src/handler.handler',
+      handler: 'src/example/src/handler.handler',
       link: [connections, posts, api],
       environment: env,
     };
@@ -85,7 +85,7 @@ export default $config({
     api.route('$default', route);
 
     const web = new sst.aws.StaticSite('Web', {
-      path: 'public',
+      path: 'src/example/public',
       environment: { WS_URL: api.url },
       build: {
         // Write config.js so the static client learns the deployed wss:// URL.

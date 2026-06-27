@@ -9,10 +9,23 @@
  *  (e.g. to Socket.IO's IoAdapter) and the gateway code is identical.
  * ========================================================================== */
 
-import { EventEmitter } from 'events';
-import { ConnectionStore, RealtimePublisher, ConnectionGoneError } from './ports';
-import { ApiGwWsEvent, ApiGwResponse, ClientFrame, EVENT_TYPE, ROUTE } from './contract';
-import { PROVIDER } from './config';
+import { EventEmitter } from "events";
+import { Subscription } from "rxjs";
+import {
+  ConnectionStore,
+  RealtimePublisher,
+  ConnectionGoneError,
+} from "./ports";
+import {
+  ApiGwWsEvent,
+  ApiGwResponse,
+  ClientFrame,
+  EVENT_TYPE,
+  ROUTE,
+} from "./contract";
+import { PROVIDER } from "./config";
+import { flushBroadcasts } from "./broadcast-queue";
+import { BaseWsInstance } from "@nestjs/websockets";
 
 /** Synthetic per-connection socket. Mirrors the Socket.IO client API used inside
  *  gateways (connectionId, join/leave, emit) — rooms are persisted by the store,
@@ -23,6 +36,10 @@ export class GatewayClient {
    *  what lets dispatch() await completion before a Lambda freezes. */
   handleFrame?: (frame: ClientFrame) => Promise<void>;
 
+  /** Live rxjs subscriptions opened by streaming handlers (Observable returns).
+   *  Kept so they can be torn down on disconnect. */
+  readonly subscriptions: Subscription[] = [];
+
   constructor(
     readonly connectionId: string,
     private readonly store: ConnectionStore,
@@ -31,7 +48,11 @@ export class GatewayClient {
 
   /** Send a frame back to THIS connection (used by the adapter for acks). */
   send(frame: ClientFrame) {
-    return this.publisher.toConnection(this.connectionId, frame.event, frame.data);
+    return this.publisher.toConnection(
+      this.connectionId,
+      frame.event,
+      frame.data,
+    );
   }
   /** Socket.IO-style: emit an event to THIS connection. */
   emit(event: string, data: unknown) {
@@ -49,12 +70,13 @@ export class GatewayClient {
 /** Synthetic server handed to @WebSocketServer(). Mirrors Socket.IO's server API
  *  (to(room).emit) and doubles as the connection hub (an EventEmitter Nest binds
  *  'connection' on). */
-export class GatewayServer extends EventEmitter {
-  constructor(
-    private readonly store: ConnectionStore,
-    private readonly publisher: RealtimePublisher,
-  ) {
+export class GatewayServer extends EventEmitter implements BaseWsInstance {
+  constructor(private readonly publisher: RealtimePublisher) {
     super();
+  }
+  
+  close() {
+    super.removeAllListeners();
   }
 
   /** Socket.IO-style room broadcast. Returns an awaitable so handlers can ensure
@@ -77,22 +99,25 @@ export class GatewayBridge {
     private readonly store: ConnectionStore,
     private readonly publisher: RealtimePublisher,
   ) {
-    this.server = new GatewayServer(store, publisher);
+    this.server = new GatewayServer(publisher);
   }
 
   /** The single entry point for everything API Gateway sends us. Connection
    *  lifecycle (add/remove) is handled HERE, transparently — gateways never
    *  touch the store for that. */
   async dispatch(event: ApiGwWsEvent): Promise<ApiGwResponse> {
-    const { connectionId, routeKey, eventType, domainName, stage } = event.requestContext;
+    const { connectionId, routeKey, eventType, domainName, stage } =
+      event.requestContext;
 
-    if (PROVIDER === 'aws' && domainName) {
+    if (PROVIDER === "aws" && domainName) {
       // @connections endpoint for the publisher (per request).
       process.env.MANAGEMENT_ENDPOINT = `https://${domainName}/${stage}`;
     }
 
-    const isConnect = eventType === EVENT_TYPE.CONNECT || routeKey === ROUTE.CONNECT;
-    const isDisconnect = eventType === EVENT_TYPE.DISCONNECT || routeKey === ROUTE.DISCONNECT;
+    const isConnect =
+      eventType === EVENT_TYPE.CONNECT || routeKey === ROUTE.CONNECT;
+    const isDisconnect =
+      eventType === EVENT_TYPE.DISCONNECT || routeKey === ROUTE.DISCONNECT;
 
     try {
       if (isConnect) {
@@ -101,6 +126,8 @@ export class GatewayBridge {
       }
       if (isDisconnect) {
         await this.store.remove(connectionId); // also drops the connection from all rooms
+        const gone = this.clients.get(connectionId);
+        gone?.subscriptions.forEach(s => s.unsubscribe()); // tear down live streams
         this.clients.delete(connectionId);
         return { statusCode: 200 };
       }
@@ -114,11 +141,13 @@ export class GatewayBridge {
       // freeze mid-flight. ensureClient emits 'connection' synchronously, so the
       // adapter has already installed handleFrame by now.
       if (client.handleFrame) await client.handleFrame(frame);
+      // Drain any room broadcasts that handler .next()'d before the Lambda freezes.
+      await flushBroadcasts();
       return { statusCode: 200 };
     } catch (err) {
       // eslint-disable-next-line no-console
-      console.error('[dispatch error]', err);
-      return { statusCode: 500, body: 'dispatch failed' };
+      console.error("[dispatch error]", err);
+      return { statusCode: 500, body: "dispatch failed" };
     }
   }
 
@@ -129,7 +158,7 @@ export class GatewayBridge {
     if (!client) {
       client = new GatewayClient(connectionId, this.store, this.publisher);
       this.clients.set(connectionId, client);
-      this.server.emit('connection', client); // -> Nest calls bindMessageHandlers
+      this.server.emit("connection", client); // -> Nest calls bindMessageHandlers
     }
     return client;
   }
@@ -140,7 +169,7 @@ export class GatewayBridge {
       this.clients.delete(client.connectionId);
     } else {
       // eslint-disable-next-line no-console
-      console.error('[send error]', err); // -> DLQ in production
+      console.error("[send error]", err); // -> DLQ in production
     }
   }
 }

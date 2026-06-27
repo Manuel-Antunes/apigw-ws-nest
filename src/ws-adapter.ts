@@ -22,11 +22,16 @@
 import { HttpServer, INestApplication, WebSocketAdapter } from "@nestjs/common";
 import { MessageMappingProperties } from "@nestjs/websockets";
 import { EventEmitter } from "events";
-import { EMPTY, Observable } from "rxjs";
+import { Observable, isObservable } from "rxjs";
 import { filter } from "rxjs/operators";
 import { DISPATCH_PATH } from "./config";
 import { ApiGwWsEvent, ClientFrame } from "./contract";
 import { GatewayBridge, GatewayClient } from "./gateway-bridge";
+import { enqueueBroadcast } from "./broadcast-queue";
+
+/** Each entry Nest hands bindMessageHandlers also carries isAckHandledManually
+ *  (set when the handler declares an @Ack() param). */
+type BoundHandler = MessageMappingProperties & { isAckHandledManually?: boolean };
 
 export interface ApiGatewayWsAdapterOptions {
   /** Path the API Gateway HTTP integration POSTs WebSocket events to. */
@@ -98,44 +103,51 @@ export class ApiGatewayWsAdapter implements WebSocketAdapter {
 
   bindMessageHandlers(
     client: GatewayClient,
-    handlers: MessageMappingProperties[],
-    process: (data: any) => Observable<any>,
+    handlers: BoundHandler[],
+    _process: (data: any) => Observable<any>,
   ) {
-    // Install an AWAITABLE processor: resolves only after the handler's response
-    // observable completes AND every emitted frame has been sent. dispatch()
-    // awaits this so the Lambda stays warm until delivery finishes.
-    client.handleFrame = (frame: ClientFrame) =>
-      new Promise<void>(resolve => {
-        const sends: Promise<void>[] = [];
-        this.bindMessageHandler(frame, handlers, process)
-          .pipe(filter(result => result != null))
-          .subscribe({
-            next: response =>
-              sends.push(
-                client
-                  .send(response as ClientFrame)
-                  .catch(e => this.bridge.onSendError(client, e)),
-              ),
-            error: e => {
-              Promise.resolve(this.bridge.onSendError(client, e)).finally(() =>
-                resolve(),
-              );
-            },
-            complete: () => {
-              Promise.all(sends).then(() => resolve());
-            },
-          });
-      });
-  }
+    // Install an AWAITABLE processor. dispatch() awaits it so the Lambda stays
+    // warm until the handler ran, its @Ack/return was delivered, and any room
+    // broadcasts were enqueued.
+    client.handleFrame = async (frame: ClientFrame) => {
+      const handler = handlers.find(h => h.message === frame.event);
+      if (!handler) return;
 
-  bindMessageHandler(
-    frame: ClientFrame,
-    handlers: MessageMappingProperties[],
-    process: (data: any) => Observable<any>,
-  ): Observable<any> {
-    const handler = handlers.find(h => h.message === frame.event);
-    if (!handler) return EMPTY;
-    return process(handler.callback(frame.data));
+      // @Ack() — an immediate acknowledgement: a function returning a WsResponse,
+      // sent back to THIS client. Enqueued so dispatch flushes it before freeze.
+      const ack = (response: ClientFrame) => {
+        enqueueBroadcast(
+          client.send(response).catch(e => this.bridge.onSendError(client, e)),
+        );
+      };
+
+      // Nest pre-binds the client as args[0]; we pass (data, ack). The result is
+      // always a Promise (the WsProxy wraps handlers as async).
+      const result = await handler.callback(frame.data, ack);
+
+      // A) Observable<WsResponse> => a LIVE per-client stream. It may never
+      //    complete (a BehaviorSubject), so we do NOT await completion: keep the
+      //    subscription alive across warm invocations and enqueue each emission's
+      //    send so whichever dispatch triggered it (e.g. another client's
+      //    post.create -> subject.next) flushes it before the Lambda freezes.
+      if (isObservable(result)) {
+        const sub = result.pipe(filter(r => r != null)).subscribe({
+          next: r =>
+            enqueueBroadcast(
+              client.send(r as ClientFrame).catch(e => this.bridge.onSendError(client, e)),
+            ),
+          error: e => this.bridge.onSendError(client, e),
+        });
+        client.subscriptions.push(sub);
+        return;
+      }
+      // B) Plain return => the response, UNLESS the handler already acked via @Ack.
+      if (result != null && !handler.isAckHandledManually) {
+        await client
+          .send(result as ClientFrame)
+          .catch(e => this.bridge.onSendError(client, e));
+      }
+    };
   }
 
   close() {

@@ -127,6 +127,7 @@
         <label for="body">body</label>
         <input id="body" value="first post" />
         <button id="createBtn" disabled>publish post <span class="k">· post.create</span></button>
+        <button id="deleteBtn" disabled>delete last post <span class="k">· post.delete</span></button>
       </div>
     </section>
 
@@ -182,7 +183,7 @@
     $('wire').classList.toggle('live', live);
     $('state').textContent = live ? 'connected' : 'offline';
     $('cid').textContent = cid ? '· ' + cid.slice(0,8) : '';
-    for (const id of ['subBtn','listBtn','createBtn']) $(id).disabled = !live;
+    for (const id of ['subBtn','listBtn','createBtn','deleteBtn']) $(id).disabled = !live;
     const b = $('connectBtn');
     b.textContent = live ? 'disconnect' : 'connect';
     b.classList.toggle('on', live);
@@ -208,13 +209,19 @@
     ws.onmessage = (e) => {
       let msg; try { msg = JSON.parse(e.data); } catch { row('sys', 'non-json: ' + e.data); return; }
       if (msg.event === '$connected'){ setLive(true, msg.data.connectionId); }
+      // Track the most recent post id so "delete last post" has a target.
+      if ((msg.event === 'post.created' || msg.event === 'post.create.ack') && msg.data && msg.data.id) {
+        lastPostId = msg.data.id;
+      }
       row('out', msg.event, msg.data);
     };
   };
 
+  let lastPostId = null;
   $('subBtn').onclick  = () => send('post.subscribe');
   $('listBtn').onclick = () => send('post.list');
   $('createBtn').onclick = () => send('post.create', { title: $('title').value, body: $('body').value });
+  $('deleteBtn').onclick = () => send('post.delete', { id: lastPostId });
   $('clearBtn').onclick = () => { frames.innerHTML = ''; };
 </script>
 </body>

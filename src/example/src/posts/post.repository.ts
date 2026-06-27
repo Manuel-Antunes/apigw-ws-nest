@@ -7,7 +7,7 @@
 
 import { randomUUID } from 'crypto';
 import { Injectable } from '@nestjs/common';
-import { PROVIDER } from '../../apigw-ws';
+import { PROVIDER } from '../../..';
 
 /** DI token for the repository port (demo-specific, lives with the feature). */
 export const POST_REPOSITORY = Symbol('POST_REPOSITORY');
@@ -22,6 +22,7 @@ export interface Post {
 export interface PostRepository {
   create(input: { title: string; body: string }): Promise<Post>;
   list(): Promise<Post[]>;
+  remove(id: string): Promise<void>;
 }
 
 @Injectable()
@@ -40,6 +41,10 @@ export class InMemoryPostRepository implements PostRepository {
   }
   async list() {
     return [...this.posts];
+  }
+  async remove(id: string) {
+    const i = this.posts.findIndex((p) => p.id === id);
+    if (i >= 0) this.posts.splice(i, 1);
   }
 }
 
@@ -66,6 +71,10 @@ export class DynamoPostRepository implements PostRepository {
     const { ScanCommand } = require('@aws-sdk/lib-dynamodb');
     const out = await this.client().send(new ScanCommand({ TableName: this.table }));
     return (out.Items ?? []) as Post[];
+  }
+  async remove(id: string): Promise<void> {
+    const { DeleteCommand } = require('@aws-sdk/lib-dynamodb');
+    await this.client().send(new DeleteCommand({ TableName: this.table, Key: { id } }));
   }
 }
 
