@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>multi-chat · apigw-ws</title>
+<style>
+  :root{
+    --ink:#0b1014; --panel:#10171d; --line:#1d2932; --muted:#5d7080; --text:#c7d6df;
+    --accent:#46e0c8; --me:#f0a23c; --dead:#3a4852;
+    --mono: ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans: system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--ink); color:var(--text); font-family:var(--sans); font-size:14px;
+       display:grid; grid-template-rows:auto 1fr; min-height:100%}
+  header{border-bottom:1px solid var(--line); padding:14px 20px; display:flex; gap:16px; align-items:center; flex-wrap:wrap}
+  .brand{font-family:var(--mono); color:var(--muted)} .brand b{color:var(--text)}
+  .status{font-family:var(--mono); font-size:12px; display:flex; gap:8px; align-items:center; margin-left:auto}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--dead)} .dot.live{background:var(--accent)}
+  input{background:var(--ink); border:1px solid var(--line); color:var(--text); font-family:var(--mono);
+        font-size:13px; padding:8px 10px; border-radius:6px}
+  button{font-family:var(--mono); font-size:13px; background:var(--panel); color:var(--text);
+         border:1px solid var(--line); padding:8px 11px; border-radius:6px; cursor:pointer}
+  button:hover:not(:disabled){border-color:var(--accent); color:var(--accent)}
+  button:disabled{opacity:.4; cursor:not-allowed}
+  .primary{background:var(--accent); color:#04100c; border-color:var(--accent); font-weight:600}
+  main{display:grid; grid-template-columns:300px 1fr; min-height:0}
+  .side{border-right:1px solid var(--line); padding:16px; display:flex; flex-direction:column; gap:14px; overflow:auto}
+  .eyebrow{font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted)}
+  .row{display:flex; gap:8px} .row input{flex:1}
+  #convList{display:flex; flex-direction:column; gap:6px}
+  .conv{text-align:left} .conv.active{border-color:var(--me); color:var(--me)}
+  .chat{display:flex; flex-direction:column; min-height:0}
+  .chatbar{padding:12px 20px; border-bottom:1px solid var(--line); font-family:var(--mono); color:var(--muted)}
+  .chatbar b{color:var(--text)}
+  #messages{flex:1; overflow:auto; padding:14px 20px; display:flex; flex-direction:column; gap:8px}
+  .msg{font-family:var(--mono); font-size:13px}
+  .msg .who{color:var(--accent)} .msg.mine .who{color:var(--me)}
+  .composer{display:flex; gap:8px; padding:12px 20px; border-top:1px solid var(--line)}
+  .composer input{flex:1}
+  .empty{color:var(--muted); font-family:var(--mono); font-size:12px; padding:24px 0}
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand"><b>multi-chat</b> · apigw-ws · scoped topics (rooms)</div>
+    <div class="row" style="gap:8px">
+      <input id="name" placeholder="your name" value="Anon" />
+      <button class="primary" id="connectBtn">connect</button>
+    </div>
+    <div class="status"><span class="dot" id="dot"></span><span id="state">offline</span><span id="cid" style="color:var(--muted)"></span></div>
+  </header>
+
+  <main>
+    <section class="side">
+      <div class="eyebrow">new conversation</div>
+      <div class="row">
+        <input id="convTitle" placeholder="title" value="General" />
+        <button id="createBtn" disabled>create</button>
+      </div>
+      <div class="eyebrow">conversations</div>
+      <div id="convList"><div class="empty" id="convEmpty">none yet</div></div>
+    </section>
+
+    <section class="chat">
+      <div class="chatbar">conversation: <b id="activeTitle">—</b> <span id="activeId" style="color:var(--muted)"></span></div>
+      <div id="messages"><div class="empty">join a conversation to see its messages</div></div>
+      <div class="composer">
+        <input id="msgText" placeholder="message" disabled />
+        <button id="sendBtn" disabled>send</button>
+      </div>
+    </section>
+  </main>
+
+<script src="config.js"></script>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const WS_URL = window.__WS_URL__ ||
+    ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
+
+  let ws = null;
+  let activeConvId = null;
+  const convs = new Map();      // id -> {id, title}
+  let myName = 'Anon';
+
+  function setLive(live, cid){
+    $('dot').classList.toggle('live', live);
+    $('state').textContent = live ? 'connected' : 'offline';
+    $('cid').textContent = cid ? '· ' + cid.slice(0,8) : '';
+    $('createBtn').disabled = !live;
+    updateComposer();
+  }
+  function updateComposer(){
+    const can = !!(ws && ws.readyState === WebSocket.OPEN && activeConvId);
+    $('msgText').disabled = !can;
+    $('sendBtn').disabled = !can;
+  }
+
+  function send(event, data){
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ event, data: data || {} }));
+  }
+
+  function renderConvs(){
+    const list = $('convList');
+    list.innerHTML = '';
+    if (convs.size === 0){ list.innerHTML = '<div class="empty" id="convEmpty">none yet</div>'; return; }
+    for (const c of convs.values()){
+      const b = document.createElement('button');
+      b.className = 'conv' + (c.id === activeConvId ? ' active' : '');
+      b.dataset.id = c.id; b.dataset.title = c.title;
+      b.textContent = c.title;
+      b.onclick = () => joinConversation(c.id);
+      list.appendChild(b);
+    }
+  }
+  function addConv(c){ if (c && c.id && !convs.has(c.id)){ convs.set(c.id, { id:c.id, title:c.title }); renderConvs(); } }
+
+  function clearMessages(){ $('messages').innerHTML = ''; }
+  function addMessage(m){
+    const el = document.createElement('div');
+    el.className = 'msg' + (m.from === myName ? ' mine' : '');
+    el.dataset.from = m.from; el.dataset.text = m.text; el.dataset.conv = m.conversationId;
+    el.innerHTML = '<span class="who"></span>: <span class="body"></span>';
+    el.querySelector('.who').textContent = m.from;
+    el.querySelector('.body').textContent = m.text;
+    $('messages').appendChild(el);
+    $('messages').scrollTop = $('messages').scrollHeight;
+  }
+
+  function joinConversation(id){
+    if (activeConvId && activeConvId !== id) send('chat.leave', { conversationId: activeConvId });
+    send('chat.join', { conversationId: id });
+  }
+
+  $('connectBtn').onclick = () => {
+    if (ws){ ws.close(); return; }
+    myName = $('name').value || 'Anon';
+    ws = new WebSocket(WS_URL);
+    ws.onopen = () => { setLive(true); send('chat.conversations'); };
+    ws.onclose = () => { setLive(false); ws = null; };
+    ws.onmessage = (e) => {
+      let msg; try { msg = JSON.parse(e.data); } catch { return; }
+      const { event, data } = msg;
+      if (event === '$connected') setLive(true, data.connectionId);
+      else if (event === 'chat.conversations') { (data || []).forEach(addConv); }
+      else if (event === 'chat.conversation.created') addConv(data);
+      else if (event === 'chat.created') { addConv(data); joinConversation(data.id); }
+      else if (event === 'chat.joined') {
+        activeConvId = data.conversationId;
+        const c = convs.get(activeConvId);
+        $('activeTitle').textContent = c ? c.title : activeConvId;
+        $('activeId').textContent = '· ' + String(activeConvId).slice(0,8);
+        clearMessages();
+        (data.messages || []).forEach(addMessage);
+        renderConvs(); updateComposer();
+      }
+      else if (event === 'chat.left') { /* no-op in UI */ }
+      else if (event === 'chat.message') {
+        // Only render messages for the conversation we're currently viewing.
+        if (data.conversationId === activeConvId) addMessage(data);
+      }
+    };
+  };
+
+  $('createBtn').onclick = () => send('chat.create', { title: $('convTitle').value || 'untitled' });
+  $('sendBtn').onclick = () => {
+    const text = $('msgText').value; if (!text || !activeConvId) return;
+    send('chat.send', { conversationId: activeConvId, from: myName, text });
+    $('msgText').value = '';
+  };
+  $('msgText').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('sendBtn').click(); });
+</script>
+</body>
+</html>

@@ -32,23 +32,64 @@ export class DynamoConnectionStore implements ConnectionStore {
     );
   }
   async remove(id: string) {
-    const { DeleteCommand } = require('@aws-sdk/lib-dynamodb');
-    await this.client().send(
-      new DeleteCommand({ TableName: this.table, Key: { pk: `CONN#${id}`, sk: 'META' } }),
+    const { QueryCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
+    // Drop the connection AND every room it was in. The reverse rows written by
+    // join() (CONN#id / ROOM#room) let us find them with a single-partition
+    // query — without them, membersOf() would keep returning this dead id
+    // forever and every broadcast would waste a doomed send on it.
+    const owned = await this.client().send(
+      new QueryCommand({
+        TableName: this.table,
+        KeyConditionExpression: 'pk = :pk',
+        ExpressionAttributeValues: { ':pk': `CONN#${id}` },
+      }),
+    );
+    await Promise.all(
+      (owned.Items ?? []).flatMap((item: any) => {
+        const sk = String(item.sk);
+        // Always delete the owned row (META + each ROOM# reverse row).
+        const deletes = [
+          this.client().send(
+            new DeleteCommand({ TableName: this.table, Key: { pk: `CONN#${id}`, sk } }),
+          ),
+        ];
+        // For a reverse room row, also delete the mirrored forward membership row.
+        if (sk.startsWith('ROOM#')) {
+          const room = sk.slice('ROOM#'.length);
+          deletes.push(
+            this.client().send(
+              new DeleteCommand({ TableName: this.table, Key: { pk: `ROOM#${room}`, sk: `CONN#${id}` } }),
+            ),
+          );
+        }
+        return deletes;
+      }),
     );
   }
   async join(id: string, room: string) {
     const { PutCommand } = require('@aws-sdk/lib-dynamodb');
-    // Interest map row, queryable by room via the partition key.
-    await this.client().send(
-      new PutCommand({ TableName: this.table, Item: { pk: `ROOM#${room}`, sk: `CONN#${id}` } }),
-    );
+    // Two mirrored rows: a FORWARD row queryable by room (membersOf) and a
+    // REVERSE row queryable by connection (so remove() can clear every room on
+    // disconnect — API Gateway's $disconnect is best-effort, but so is the ttl).
+    await Promise.all([
+      this.client().send(
+        new PutCommand({ TableName: this.table, Item: { pk: `ROOM#${room}`, sk: `CONN#${id}` } }),
+      ),
+      this.client().send(
+        new PutCommand({ TableName: this.table, Item: { pk: `CONN#${id}`, sk: `ROOM#${room}` } }),
+      ),
+    ]);
   }
   async leave(id: string, room: string) {
     const { DeleteCommand } = require('@aws-sdk/lib-dynamodb');
-    await this.client().send(
-      new DeleteCommand({ TableName: this.table, Key: { pk: `ROOM#${room}`, sk: `CONN#${id}` } }),
-    );
+    await Promise.all([
+      this.client().send(
+        new DeleteCommand({ TableName: this.table, Key: { pk: `ROOM#${room}`, sk: `CONN#${id}` } }),
+      ),
+      this.client().send(
+        new DeleteCommand({ TableName: this.table, Key: { pk: `CONN#${id}`, sk: `ROOM#${room}` } }),
+      ),
+    ]);
   }
   async membersOf(room: string) {
     const { QueryCommand } = require('@aws-sdk/lib-dynamodb');

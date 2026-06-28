@@ -6,6 +6,7 @@
  *  Resources (us-east-1):
  *    - Dynamo "Connections" : connection registry + room interest map (pk/sk)
  *    - Dynamo "Posts"        : the feed (plain table)
+ *    - Dynamo "Chat"         : conversations + messages, single-table (pk/sk)
  *    - ApiGatewayWebSocket   : $connect/$disconnect/$default -> src/handler
  *    - StaticSite "Web"      : the test client (public/), injected with the wss URL
  *
@@ -65,6 +66,14 @@ export default $config({
       fields: { id: 'string' },
       primaryIndex: { hashKey: 'id' },
     });
+    
+    // Single-table layout (see DynamoConversationRepository): pk/sk, NOT a plain
+    // `id` key. Conversations live under pk='CONVO' (queryable as a directory),
+    // each conversation's messages under pk='CONVO#<id>' sorted by sk.
+    const chat = new sst.aws.Dynamo('Chat', {
+      fields: { pk: 'string', sk: 'string' },
+      primaryIndex: { hashKey: 'pk', rangeKey: 'sk' },
+    });
 
     const api = new sst.aws.ApiGatewayWebSocket('Api');
 
@@ -72,10 +81,14 @@ export default $config({
       RT_PROVIDER: 'aws',
       CONNECTIONS_TABLE: connections.name,
       POSTS_TABLE: posts.name,
+      CHAT_TABLE: chat.name,
     };
     const route = {
       handler: 'src/example/src/handler.handler',
-      link: [connections, posts, api],
+      // link grants the Lambda IAM for each resource (DynamoDB CRUD on the tables,
+      // execute-api:ManageConnections on the api). `chat` MUST be here or its
+      // PutItem/Query throw AccessDeniedException.
+      link: [connections, posts, chat, api],
       environment: env,
     };
 

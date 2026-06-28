@@ -25,7 +25,13 @@ import {
 } from "./contract";
 import { PROVIDER } from "./config";
 import { flushBroadcasts } from "./broadcast-queue";
-import { BaseWsInstance } from "@nestjs/websockets";
+import { BaseWsInstance, MessageMappingProperties } from "@nestjs/websockets";
+
+/** One @SubscribeMessage route. (Nest also tags handlers that take an @Ack()
+ *  param with isAckHandledManually so the adapter won't double-send a response.) */
+export type BoundHandler = MessageMappingProperties & {
+  isAckHandledManually?: boolean;
+};
 
 /** Synthetic per-connection socket. Mirrors the Socket.IO client API used inside
  *  gateways (connectionId, join/leave, emit) — rooms are persisted by the store,
@@ -35,6 +41,11 @@ export class GatewayClient {
    *  Resolves only AFTER the handler ran and every response was sent — which is
    *  what lets dispatch() await completion before a Lambda freezes. */
   handleFrame?: (frame: ClientFrame) => Promise<void>;
+
+  /** Routes by event name, MERGED across every @WebSocketGateway bound to this
+   *  connection. Each gateway's bindMessageHandlers adds its routes here, so all
+   *  gateways stay reachable (not just the last one bound). */
+  readonly handlers = new Map<string, BoundHandler>();
 
   /** Live rxjs subscriptions opened by streaming handlers (Observable returns).
    *  Kept so they can be torn down on disconnect. */
@@ -67,14 +78,30 @@ export class GatewayClient {
   }
 }
 
+/** The room EVERY connection is auto-joined to on $connect (see
+ *  GatewayBridge.dispatch). It's the durable backing for a "global" channel:
+ *  server.emit(event, data) fans out to it, so it reaches every client across
+ *  every instance — no explicit subscribe needed. A sentinel name so it can't
+ *  collide with an application room. */
+export const GLOBAL_ROOM = "@@global";
+
+/** EventEmitter's own/internal events. These must keep going to the in-process
+ *  listeners (the Nest 'connection' hub, error handling) instead of the wire. */
+const RESERVED_EVENTS = new Set([
+  "connection",
+  "newListener",
+  "removeListener",
+  "error",
+]);
+
 /** Synthetic server handed to @WebSocketServer(). Mirrors Socket.IO's server API
- *  (to(room).emit) and doubles as the connection hub (an EventEmitter Nest binds
- *  'connection' on). */
+ *  (to(room).emit for a room, emit(...) for a GLOBAL broadcast) and doubles as
+ *  the connection hub (an EventEmitter Nest binds 'connection' on). */
 export class GatewayServer extends EventEmitter implements BaseWsInstance {
   constructor(private readonly publisher: RealtimePublisher) {
     super();
   }
-  
+
   close() {
     super.removeAllListeners();
   }
@@ -86,6 +113,20 @@ export class GatewayServer extends EventEmitter implements BaseWsInstance {
       emit: (event: string, data: unknown): Promise<void> =>
         this.publisher.toRoom(room, event, data),
     };
+  }
+
+  /** Socket.IO-style GLOBAL broadcast — the `io.emit(event, data)` analog. Every
+   *  connection is auto-joined to GLOBAL_ROOM on $connect, so this reaches all of
+   *  them, across instances, via the store + publisher. Returns an awaitable so a
+   *  handler can `await` it before the Lambda freezes.
+   *
+   *  Reserved EventEmitter events (notably the internal 'connection' hub Nest
+   *  binds on us) are delegated to the base emitter rather than broadcast. */
+  emit(event: string | symbol, ...args: any[]): any {
+    if (typeof event === "symbol" || RESERVED_EVENTS.has(event)) {
+      return super.emit(event as any, ...args);
+    }
+    return this.publisher.toRoom(GLOBAL_ROOM, event, args[0]);
   }
 }
 
@@ -122,6 +163,10 @@ export class GatewayBridge {
     try {
       if (isConnect) {
         await this.store.add(connectionId, { connectedAt: Date.now() });
+        // Auto-subscribe to the global channel, persisted in the store — so a
+        // later server.emit(...) reaches this connection from ANY instance, with
+        // no explicit subscribe. ($disconnect's store.remove drops it again.)
+        await this.store.join(connectionId, GLOBAL_ROOM);
         return { statusCode: 200 };
       }
       if (isDisconnect) {

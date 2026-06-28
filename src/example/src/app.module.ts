@@ -8,8 +8,9 @@
 
 import { Module } from '@nestjs/common';
 import { PostModule } from './posts/post.module';
+import { ChatModule } from './chat/chat.module';
 
 @Module({
-  imports: [PostModule],
+  imports: [PostModule, ChatModule],
 })
 export class AppModule {}

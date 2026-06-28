@@ -2,3 +2,4 @@ node_modules
 .sst
 .playwright-mcp
 dist
+.env

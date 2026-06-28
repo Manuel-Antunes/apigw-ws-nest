@@ -20,18 +20,13 @@
  * ========================================================================== */
 
 import { HttpServer, INestApplication, WebSocketAdapter } from "@nestjs/common";
-import { MessageMappingProperties } from "@nestjs/websockets";
 import { EventEmitter } from "events";
 import { Observable, isObservable } from "rxjs";
 import { filter } from "rxjs/operators";
 import { DISPATCH_PATH } from "./config";
 import { ApiGwWsEvent, ClientFrame } from "./contract";
-import { GatewayBridge, GatewayClient } from "./gateway-bridge";
+import { GatewayBridge, GatewayClient, BoundHandler } from "./gateway-bridge";
 import { enqueueBroadcast } from "./broadcast-queue";
-
-/** Each entry Nest hands bindMessageHandlers also carries isAckHandledManually
- *  (set when the handler declares an @Ack() param). */
-type BoundHandler = MessageMappingProperties & { isAckHandledManually?: boolean };
 
 export interface ApiGatewayWsAdapterOptions {
   /** Path the API Gateway HTTP integration POSTs WebSocket events to. */
@@ -106,11 +101,18 @@ export class ApiGatewayWsAdapter implements WebSocketAdapter {
     handlers: BoundHandler[],
     _process: (data: any) => Observable<any>,
   ) {
-    // Install an AWAITABLE processor. dispatch() awaits it so the Lambda stays
-    // warm until the handler ran, its @Ack/return was delivered, and any room
-    // broadcasts were enqueued.
+    // Nest calls this ONCE PER @WebSocketGateway for the same connection. Merge
+    // each gateway's routes into the client's handler map instead of overwriting,
+    // so every gateway stays reachable — not just the last one bound.
+    for (const h of handlers) client.handlers.set(h.message, h);
+
+    // Install the AWAITABLE processor exactly once. dispatch() awaits it so the
+    // Lambda stays warm until the handler ran, its @Ack/return was delivered, and
+    // any room broadcasts were enqueued. It resolves routes from client.handlers,
+    // so it sees handlers added by gateways bound after this point too.
+    if (client.handleFrame) return;
     client.handleFrame = async (frame: ClientFrame) => {
-      const handler = handlers.find(h => h.message === frame.event);
+      const handler = client.handlers.get(frame.event);
       if (!handler) return;
 
       // @Ack() — an immediate acknowledgement: a function returning a WsResponse,
@@ -152,5 +154,13 @@ export class ApiGatewayWsAdapter implements WebSocketAdapter {
 
   close() {
     /* nothing to tear down — API Gateway owns the sockets */
+  }
+
+  // Nest 11's SocketModule.close() calls adapter.dispose() during app shutdown
+  // (app.close()). We hold no sockets/servers of our own, so this is a no-op —
+  // but it MUST exist, or graceful shutdown throws "adapter.dispose is not a
+  // function".
+  dispose() {
+    /* nothing to dispose — API Gateway owns the sockets */
   }
 }

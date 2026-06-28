@@ -11,6 +11,10 @@ declare module "sst" {
       "type": "sst.aws.ApiGatewayWebSocket"
       "url": string
     }
+    "Chat": {
+      "name": string
+      "type": "sst.aws.Dynamo"
+    }
     "Connections": {
       "name": string
       "type": "sst.aws.Dynamo"

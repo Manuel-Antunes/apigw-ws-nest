@@ -1,17 +1,27 @@
 /* =============================================================================
- *  PostGateway — two coexisting NestJS WebSocket patterns over API Gateway.
+ *  PostGateway — NestJS WebSocket gateway over API Gateway.
  * =============================================================================
- *  1) rxjs streams + @Ack (NestJS 11):
- *       - a plain BehaviorSubject of posts, mapped to Observable<WsResponse> by a
- *         private function; returning it from a handler streams to the caller.
- *       - @Ack() is the immediate acknowledgement, separate from the stream.
+ *  Written against the STANDARD Socket.IO-shaped surface — @WebSocketServer()
+ *  server.to(room).emit(...) to broadcast, @ConnectedSocket() client.join(room)
+ *  to subscribe. Nothing here knows about API Gateway, DynamoDB, or the
+ *  @connections API; the adapter + bridge make it work over Lambda.
  *
- *  2) the classic server/client API (Socket.IO-shaped):
- *       - @WebSocketServer() server.to(room).emit(...) to broadcast.
- *       - @ConnectedSocket() client.join(room) to subscribe.
+ *  TWO durable, cross-instance channels — both backed by the ConnectionStore:
+ *    - GLOBAL:   server.emit('post.created', post) reaches EVERY connection.
+ *                No subscribe needed — every socket is auto-joined to the global
+ *                room on $connect (see GatewayBridge). New posts are a public feed.
+ *    - SPECIFIC: client.join('posts') opts a connection in; server.to('posts')
+ *                .emit('post.deleted', ...) reaches ONLY those who joined.
  *
- *  Both run side by side without interfering. Nothing here knows about API
- *  Gateway, DynamoDB, or the @connections API — only rxjs + NestJS.
+ *  WHY NOT AN IN-PROCESS EventEmitter / rxjs Subject:
+ *  Every Lambda invocation may run on a DIFFERENT (or freshly redeployed)
+ *  container, and a container FREEZES the moment its handler returns. In-process
+ *  pub/sub — an rxjs Subject, `fromEvent(emitter, ...)`, a Map of callbacks —
+ *  lives and dies with ONE container, so it only ever reaches listeners in that
+ *  SAME warm container; the instant the subscriber's container is replaced the
+ *  broadcast is silently lost. The store-backed channels above don't have that
+ *  problem: membership and delivery both go through state that outlives any one
+ *  container (DynamoDB + the @connections API).
  * ========================================================================== */
 
 import { Inject } from "@nestjs/common";
@@ -24,62 +34,52 @@ import {
   Ack,
   WsResponse,
 } from "@nestjs/websockets";
-import { BehaviorSubject, Observable } from "rxjs";
-import { filter, map } from "rxjs/operators";
 import { GatewayClient, GatewayServer } from "../../..";
 import { PostService } from "./post.service";
 import { Post } from "./post.repository";
 
+/** The SPECIFIC room a client opts into via post.subscribe; only its members get
+ *  post.deleted. (post.created is GLOBAL — every connection, no join needed.) */
+const FEED_ROOM = "posts";
+
 @WebSocketGateway()
 export class PostGateway {
-  /** Classic broadcast surface (used by post.delete). */
+  /** Broadcast surface — durable, cross-instance fan-out via the ConnectionStore. */
   @WebSocketServer() server: GatewayServer;
-
-  /** Plain rxjs BehaviorSubject: the latest created post (null until the first). */
-  private readonly posts$ = new BehaviorSubject<Post | null>(null);
 
   constructor(@Inject(PostService) private readonly posts: PostService) {}
 
-  /** Map the posts BehaviorSubject to an Observable<WsResponse>. */
-  private feed(): Observable<WsResponse> {
-    return this.posts$.pipe(
-      filter((post): post is Post => post !== null),
-      map(post => ({ event: "post.created", data: post })),
-    );
-  }
-
-  // ---- rxjs pattern -------------------------------------------------------
-
-  // Subscribe: join the 'posts' room (so classic emits like post.deleted reach
-  // this client too) AND return the rxjs feed (Observable<WsResponse>).
+  // Subscribe: opt INTO the specific 'posts' room. Used here for targeted
+  // post.deleted notices — global post.created already reaches everyone.
   @SubscribeMessage("post.subscribe")
   subscribe(
     @ConnectedSocket() client: GatewayClient,
     @Ack() ack: (response: WsResponse) => void,
   ) {
-    client.join("posts");
-    ack({ event: "post.subscribed", data: { room: "posts" } });
-    return this.feed();
+    client.join(FEED_ROOM);
+    ack({ event: "post.subscribed", data: { room: FEED_ROOM } });
   }
 
-  // Create: push the new post onto the subject; the feed streams 'post.created'.
+  // Create: persist the post, then broadcast 'post.created' GLOBALLY via
+  // server.emit(...). Every connected client receives it — across instances and
+  // without having subscribed — because all sockets are auto-joined to the
+  // global room on $connect. @Ack is the immediate acknowledgement to the caller.
   @SubscribeMessage("post.create")
   async create(
     @MessageBody() data: { title: string; body: string },
     @Ack() ack: (response: WsResponse) => void,
   ) {
     const post = await this.posts.create(data);
-    this.posts$.next(post);
+    await this.server.emit("post.created", post);
     ack({ event: "post.create.ack", data: { id: post.id } });
   }
 
-  // ---- classic server/client pattern (coexists with the rxjs one) ---------
-
-  // Delete: broadcast 'post.deleted' to the room via the @WebSocketServer().
+  // Delete: broadcast 'post.deleted' to the SPECIFIC room — only connections that
+  // ran post.subscribe receive it.
   @SubscribeMessage("post.delete")
   async deletePost(@MessageBody() data: { id: string }) {
     await this.posts.remove(data.id);
-    await this.server.to("posts").emit("post.deleted", { id: data.id });
+    await this.server.to(FEED_ROOM).emit("post.deleted", { id: data.id });
     return { event: "post.delete.ack", data: { id: data.id } }; // plain return = ack to caller
   }
 

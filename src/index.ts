@@ -20,7 +20,7 @@ export { createGatewayBridge, connectionStore, publisher } from './runtime';
 // transport internals (advanced / custom wiring)
 export { ApiGatewayWsAdapter } from './ws-adapter';
 export type { ApiGatewayWsAdapterOptions } from './ws-adapter';
-export { GatewayBridge, GatewayClient, GatewayServer } from './gateway-bridge';
+export { GatewayBridge, GatewayClient, GatewayServer, GLOBAL_ROOM } from './gateway-bridge';
 
 // ports + contract types
 export type { ConnectionStore, RealtimePublisher, SessionMeta } from './ports';
