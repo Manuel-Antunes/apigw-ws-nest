@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm version comes from the "packageManager" field in package.json.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Typecheck (lib + example)
+        run: pnpm run typecheck
+
+      - name: Build (ESM + CJS + types)
+        run: pnpm run build
+
+      # Prove both bundles actually load — catches the ESM/CJS require interop traps.
+      - name: Smoke-test CJS bundle
+        run: node -e "const m=require('./dist/index.cjs'); if(!m.createNestApp) throw new Error('cjs export missing'); console.log('cjs ok')"
+
+      - name: Smoke-test ESM bundle
+        run: node --input-type=module -e "import('./dist/index.mjs').then(m=>{if(!m.createNestApp) throw new Error('esm export missing'); console.log('esm ok')})"

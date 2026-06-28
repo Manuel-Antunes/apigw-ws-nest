@@ -1,9 +1,61 @@
 {
   "name": "apigw-ws-nest",
   "version": "1.0.0",
-  "description": "NestJS custom WebSocketAdapter over AWS API Gateway WebSocket + DynamoDB Streams, with a Lambda handler and a local emulator",
+  "description": "NestJS custom WebSocketAdapter over AWS API Gateway WebSocket + DynamoDB, with a Lambda handler and a local emulator",
+  "license": "MIT",
+  "author": "Manuel Antunes",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Manuel-Antunes/nestjs-websockets-api-gateway-platform.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Manuel-Antunes/nestjs-websockets-api-gateway-platform/issues"
+  },
+  "homepage": "https://github.com/Manuel-Antunes/nestjs-websockets-api-gateway-platform#readme",
+  "type": "commonjs",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": [
+    "./dist/index.cjs",
+    "./dist/index.mjs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "packageManager": "pnpm@10.30.3",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "nestjs",
+    "websocket",
+    "websocketadapter",
+    "api-gateway",
+    "aws",
+    "lambda",
+    "serverless",
+    "dynamodb",
+    "socket.io"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/build.mjs && tsc -p tsconfig.build.json",
+    "build:js": "node scripts/build.mjs",
+    "build:types": "tsc -p tsconfig.build.json",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepublishOnly": "node scripts/build.mjs && tsc -p tsconfig.build.json",
     "dev": "ts-node src/example/src/local-server.ts",
     "start:http": "ts-node src/example/src/bootstrap.ts",
     "start:http:aws": "RT_PROVIDER=aws ts-node src/example/src/bootstrap.ts",
@@ -15,10 +67,8 @@
     "@nestjs/core": "^11.0.0",
     "@nestjs/platform-express": "^11.0.0",
     "@nestjs/websockets": "^11.0.0",
-    "dotenv": "^17.4.2",
     "reflect-metadata": "^0.2.0",
-    "rxjs": "^7.8.0",
-    "ws": "^8.17.0"
+    "rxjs": "^7.8.0"
   },
   "optionalDependencies": {
     "@aws-sdk/client-apigatewaymanagementapi": "^3.600.0",
@@ -31,8 +81,16 @@
     "@types/aws-lambda": "^8.10.162",
     "@types/node": "^20.0.0",
     "@types/ws": "^8.5.0",
+    "dotenv": "^17.4.2",
+    "esbuild": "^0.28.1",
     "sst": "^3.19.3",
     "ts-node": "^10.9.0",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "ws": "^8.17.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   }
 }

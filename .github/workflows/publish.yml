@@ -1,0 +1,43 @@
+name: Publish
+
+# Publishes to npm when a GitHub Release is published (tag the release vX.Y.Z and
+# make sure package.json "version" matches). Also runnable manually.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # required for npm provenance (signed build attestation via OIDC).
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build (ESM + CJS + types)
+        run: pnpm run build
+
+      # Requires an NPM_TOKEN secret (an npm "Automation" access token).
+      # NPM_CONFIG_PROVENANCE attaches a signed link from the published package
+      # back to this repo + commit; it needs id-token:write (above) and the
+      # package.json "repository" field, and only works from GitHub Actions.
+      # (pnpm has no --provenance flag — it reads this npm config setting.)
+      - name: Publish to npm (with provenance)
+        run: pnpm publish --access public --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: true
