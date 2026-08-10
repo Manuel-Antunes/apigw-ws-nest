@@ -1,6 +1,6 @@
 {
   "name": "apigw-ws-nest",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "NestJS custom WebSocketAdapter over AWS API Gateway WebSocket + DynamoDB, with a Lambda handler and a local emulator",
   "license": "MIT",
   "author": "Manuel Antunes",
