@@ -3,3 +3,5 @@ node_modules
 .playwright-mcp
 dist
 .env
+# tsc output bundled into the Lambda (see tsconfig.lambda.json)
+.lambda/

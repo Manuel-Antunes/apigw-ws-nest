@@ -10,7 +10,7 @@
  * ========================================================================== */
 
 import { PROVIDER } from './config';
-import { GatewayBridge } from './gateway-bridge';
+import { GatewayBridge, GatewayBridgeOptions } from './gateway-bridge';
 import { ConnectionStore, RealtimePublisher } from './ports';
 import { InMemoryConnectionStore, LocalPublisher } from './providers/local';
 import { DynamoConnectionStore, ApiGatewayPublisher } from './providers/aws';
@@ -33,6 +33,6 @@ export function publisher(): RealtimePublisher {
 }
 
 /** Build the bridge handed to the WS adapter / Lambda handler — outside DI. */
-export function createGatewayBridge(): GatewayBridge {
-  return new GatewayBridge(connectionStore(), publisher());
+export function createGatewayBridge(options: GatewayBridgeOptions = {}): GatewayBridge {
+  return new GatewayBridge(connectionStore(), publisher(), options);
 }

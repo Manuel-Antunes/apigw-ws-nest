@@ -40,14 +40,21 @@ export class LocalPublisher implements RealtimePublisher {
   constructor(private readonly store: ConnectionStore) {}
 
   async toConnection(id: string, event: string, data: unknown) {
-    const frame = JSON.stringify({ event, data });
+    await this.send(id, { event, data }, `${event}`);
+  }
+  /** Verbatim payload — used by transports with their own wire format (GraphQL). */
+  async toConnectionRaw(id: string, payload: unknown) {
+    await this.send(id, payload, (payload as any)?.type ?? 'raw');
+  }
+
+  private async send(id: string, payload: unknown, label: string) {
     const socket = LocalSocketRegistry.get(id);
     if (socket) {
-      socket.send(frame); // deliver to the live browser WebSocket
+      socket.send(JSON.stringify(payload)); // deliver to the live browser WebSocket
     } else {
       // No socket registered (e.g. pure curl test) — make the push observable.
       // eslint-disable-next-line no-console
-      console.log(`[push -> ${id}] ${event}`, JSON.stringify(data));
+      console.log(`[push -> ${id}] ${label}`, JSON.stringify(payload));
     }
   }
   async toRoom(room: string, event: string, data: unknown) {

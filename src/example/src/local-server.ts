@@ -25,10 +25,12 @@ import {
   ApiGwWsEvent,
   EVENT_TYPE,
   ROUTE,
+  GRAPHQL_WS_SUBPROTOCOL,
   createNestApp,
   createGatewayBridge,
   GatewayBridge,
 } from "../..";
+import { enableGraphQLSubscriptions } from "../../graphql";
 import { AppModule } from "./app.module";
 
 /* ---------------------------------------------------------------------------
@@ -59,6 +61,9 @@ async function buildInstance() {
   bridge = createGatewayBridge();
   const next = await createNestApp(AppModule, bridge);
   await next.init();
+  // Re-wired against the NEW bridge on every simulated redeploy. The durable
+  // registry is a process singleton, so the subscriptions themselves survive.
+  enableGraphQLSubscriptions(next, bridge);
   app = next;
   instanceGen += 1;
   if (previous) await previous.close(); // tear the old instance down once the new one is live
@@ -72,6 +77,7 @@ const dispatch = (event: ApiGwWsEvent) => bridge.dispatch(event);
 const PORT = Number(process.env.PORT ?? 6005);
 const INDEX = path.join(__dirname, "..", "public", "index.html");
 const CHAT = path.join(__dirname, "..", "public", "chat.html");
+const GRAPHQL = path.join(__dirname, "..", "public", "graphql.html");
 
 type Phase = "connect" | "disconnect" | "message";
 
@@ -79,6 +85,7 @@ function gwEvent(
   connectionId: string,
   phase: Phase,
   body?: string,
+  headers?: Record<string, string | undefined>,
 ): ApiGwWsEvent {
   const routeKey =
     phase === "connect"
@@ -105,6 +112,9 @@ function gwEvent(
       ...(phase === "message" ? { messageId: randomUUID() } : {}),
     },
     body,
+    // API Gateway forwards the handshake headers on $connect only — that's where
+    // Sec-WebSocket-Protocol comes from, so the bridge can negotiate it.
+    ...(phase === "connect" ? { headers } : {}),
     isBase64Encoded: false,
   };
 }
@@ -120,6 +130,11 @@ async function main() {
     if (req.url === "/chat" || req.url?.startsWith("/chat.html")) {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       res.end(fs.readFileSync(CHAT));
+      return;
+    }
+    if (req.url === "/graphql" || req.url?.startsWith("/graphql.html")) {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(fs.readFileSync(GRAPHQL));
       return;
     }
     // The static site injects the deployed wss:// URL via config.js; locally we
@@ -150,17 +165,28 @@ async function main() {
   });
 
   // Real WebSocket endpoint on the same port (ws://localhost:PORT).
-  const wss = new WebSocketServer({ server });
+  // handleProtocols mirrors what API Gateway does with the Sec-WebSocket-Protocol
+  // header + the $connect response: browsers' graphql-ws client offers
+  // 'graphql-transport-ws' and aborts the handshake unless the server echoes it.
+  const wss = new WebSocketServer({
+    server,
+    handleProtocols: protocols =>
+      protocols.has(GRAPHQL_WS_SUBPROTOCOL) ? GRAPHQL_WS_SUBPROTOCOL : false,
+  });
 
-  wss.on("connection", async socket => {
+  wss.on("connection", async (socket, req) => {
     const connectionId = randomUUID();
     LocalSocketRegistry.set(connectionId, socket); // so pushes can reach it
 
     // Let the client know its id (handy in the UI; not part of API Gateway).
-    socket.send(
-      JSON.stringify({ event: "$connected", data: { connectionId } }),
+    // Skipped on a graphql-transport-ws socket: that protocol is strict about
+    // unknown messages and the client would close the connection on it.
+    if (socket.protocol !== GRAPHQL_WS_SUBPROTOCOL) {
+      socket.send(JSON.stringify({ event: "$connected", data: { connectionId } }));
+    }
+    await dispatch(
+      gwEvent(connectionId, "connect", undefined, req.headers as Record<string, string>),
     );
-    await dispatch(gwEvent(connectionId, "connect"));
 
     socket.on("message", async raw => {
       // API Gateway with a $default route delivers the raw frame as body.
@@ -180,6 +206,8 @@ async function main() {
     // eslint-disable-next-line no-console
     console.log(`local API Gateway emulator`);
     console.log(`  test client : http://localhost:${PORT}`);
+    console.log(`  multi-chat  : http://localhost:${PORT}/chat`);
+    console.log(`  graphql     : http://localhost:${PORT}/graphql`);
     console.log(`  websocket   : ws://localhost:${PORT}`);
     console.log(`  reload      : POST http://localhost:${PORT}/__reload  (= new Lambda instance)`);
   });

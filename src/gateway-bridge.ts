@@ -14,7 +14,7 @@ import { Subscription } from "rxjs";
 import {
   ConnectionStore,
   RealtimePublisher,
-  ConnectionGoneError,
+  isConnectionGone,
 } from "./ports";
 import {
   ApiGwWsEvent,
@@ -64,6 +64,18 @@ export class GatewayClient {
       frame.event,
       frame.data,
     );
+  }
+  /** Send a payload to THIS connection VERBATIM — no `{ event, data }` envelope.
+   *  For transports that own their wire format (see src/graphql). */
+  sendRaw(payload: unknown) {
+    if (!this.publisher.toConnectionRaw) {
+      return Promise.reject(
+        new Error(
+          "this RealtimePublisher does not implement toConnectionRaw(); raw-frame transports (e.g. GraphQL over WebSocket) require it",
+        ),
+      );
+    }
+    return this.publisher.toConnectionRaw(this.connectionId, payload);
   }
   /** Socket.IO-style: emit an event to THIS connection. */
   emit(event: string, data: unknown) {
@@ -130,17 +142,59 @@ export class GatewayServer extends EventEmitter implements BaseWsInstance {
   }
 }
 
+/** An alternative wire protocol plugged into dispatch(). Receives the parsed
+ *  JSON body BEFORE the `{ event, data }` routing and returns true if it owned
+ *  the frame (in which case the @SubscribeMessage path is skipped entirely).
+ *  This is how src/graphql speaks graphql-transport-ws over the same socket. */
+export type FrameHandler = (
+  frame: unknown,
+  client: GatewayClient,
+  event: ApiGwWsEvent,
+) => boolean | Promise<boolean>;
+
+/** Notified on $disconnect (and on a 410 Gone) BEFORE the store row is dropped,
+ *  so a handler can still read the connection's durable state to clean it up. */
+export type DisconnectHook = (connectionId: string) => void | Promise<void>;
+
+export interface GatewayBridgeOptions {
+  /** WebSocket subprotocols this server accepts. On $connect the FIRST one the
+   *  client offered that appears here is echoed back in Sec-WebSocket-Protocol —
+   *  which is what makes the browser's `graphql-ws` client complete its
+   *  handshake through API Gateway. */
+  subprotocols?: string[];
+}
+
+/** Offered by the browser's graphql-ws client; echoed by default so a GraphQL
+ *  subscription connection can be established with no extra configuration. */
+export const GRAPHQL_WS_SUBPROTOCOL = "graphql-transport-ws";
+
 export class GatewayBridge {
   /** Handed to Nest via the adapter's create(); becomes the gateway's
    *  @WebSocketServer() and the 'connection' hub. */
   readonly server: GatewayServer;
   private readonly clients = new Map<string, GatewayClient>();
+  private readonly frameHandlers: FrameHandler[] = [];
+  private readonly disconnectHooks: DisconnectHook[] = [];
+  private readonly subprotocols: string[];
 
   constructor(
-    private readonly store: ConnectionStore,
-    private readonly publisher: RealtimePublisher,
+    readonly store: ConnectionStore,
+    readonly publisher: RealtimePublisher,
+    options: GatewayBridgeOptions = {},
   ) {
     this.server = new GatewayServer(publisher);
+    this.subprotocols = options.subprotocols ?? [GRAPHQL_WS_SUBPROTOCOL];
+  }
+
+  /** Install an alternative wire protocol. Handlers are consulted in
+   *  registration order, before the `{ event, data }` routing. */
+  useFrameHandler(handler: FrameHandler) {
+    this.frameHandlers.push(handler);
+  }
+
+  /** Run something on $disconnect while the connection's store rows still exist. */
+  onDisconnect(hook: DisconnectHook) {
+    this.disconnectHooks.push(hook);
   }
 
   /** The single entry point for everything API Gateway sends us. Connection
@@ -162,30 +216,53 @@ export class GatewayBridge {
 
     try {
       if (isConnect) {
-        await this.store.add(connectionId, { connectedAt: Date.now() });
-        // Auto-subscribe to the global channel, persisted in the store — so a
-        // later server.emit(...) reaches this connection from ANY instance, with
-        // no explicit subscribe. ($disconnect's store.remove drops it again.)
-        await this.store.join(connectionId, GLOBAL_ROOM);
-        return { statusCode: 200 };
+        // Echo the negotiated subprotocol, or the browser aborts the handshake.
+        const accepted = this.negotiate(event.headers);
+        await this.store.add(connectionId, {
+          connectedAt: Date.now(),
+          ...(accepted ? { subprotocol: accepted } : {}),
+        });
+        if (!accepted) {
+          // Auto-subscribe to the global channel, persisted in the store — so a
+          // later server.emit(...) reaches this connection from ANY instance, with
+          // no explicit subscribe. ($disconnect's store.remove drops it again.)
+          //
+          // ONLY for sockets speaking this library's {event,data} protocol. A
+          // client that negotiated a foreign subprotocol (graphql-transport-ws)
+          // treats an unrecognised frame as a FATAL protocol violation and closes
+          // the connection — so auto-joining it here would mean one server.emit()
+          // silently disconnects every GraphQL subscriber. Its subscriptions are
+          // its own fan-out mechanism; it has no business in this room.
+          await this.store.join(connectionId, GLOBAL_ROOM);
+        }
+        return accepted
+          ? { statusCode: 200, headers: { "Sec-WebSocket-Protocol": accepted } }
+          : { statusCode: 200 };
       }
       if (isDisconnect) {
-        await this.store.remove(connectionId); // also drops the connection from all rooms
-        const gone = this.clients.get(connectionId);
-        gone?.subscriptions.forEach(s => s.unsubscribe()); // tear down live streams
-        this.clients.delete(connectionId);
+        await this.cleanup(connectionId);
         return { statusCode: 200 };
       }
 
       // Any other route = a message frame.
       const client = this.ensureClient(connectionId);
-      const frame: ClientFrame = event.body
+      const parsed: unknown = event.body
         ? JSON.parse(event.body)
         : { event: routeKey, data: {} };
+
+      // Alternative protocols (GraphQL over WebSocket) get first refusal: their
+      // frames are `{ type, id, payload }` and have no `event` to route on.
+      for (const handler of this.frameHandlers) {
+        if (await handler(parsed, client, event)) {
+          await flushBroadcasts();
+          return { statusCode: 200 };
+        }
+      }
+
       // AWAIT full processing (handler + outbound sends) so the Lambda doesn't
       // freeze mid-flight. ensureClient emits 'connection' synchronously, so the
       // adapter has already installed handleFrame by now.
-      if (client.handleFrame) await client.handleFrame(frame);
+      if (client.handleFrame) await client.handleFrame(parsed as ClientFrame);
       // Drain any room broadcasts that handler .next()'d before the Lambda freezes.
       await flushBroadcasts();
       return { statusCode: 200 };
@@ -209,12 +286,42 @@ export class GatewayBridge {
   }
 
   async onSendError(client: GatewayClient, err: unknown) {
-    if (err instanceof ConnectionGoneError) {
-      await this.store.remove(client.connectionId);
-      this.clients.delete(client.connectionId);
+    if (isConnectionGone(err)) {
+      await this.cleanup(client.connectionId); // 410 — the socket is a ghost
     } else {
       // eslint-disable-next-line no-console
       console.error("[send error]", err); // -> DLQ in production
     }
+  }
+
+  /** Forget a connection everywhere: protocol-level state first (the hooks still
+   *  need its store rows), then the store row itself, then in-process leftovers. */
+  async cleanup(connectionId: string) {
+    for (const hook of this.disconnectHooks) {
+      try {
+        await hook(connectionId);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("[disconnect hook]", err); // never block the teardown
+      }
+    }
+    await this.store.remove(connectionId); // also drops it from all rooms
+    const gone = this.clients.get(connectionId);
+    gone?.subscriptions.forEach(s => s.unsubscribe()); // tear down live streams
+    this.clients.delete(connectionId);
+  }
+
+  /** Pick the first subprotocol the client offered that we accept. API Gateway
+   *  forwards the client's Sec-WebSocket-Protocol header to $connect and sends
+   *  whatever we echo back; a browser that offered subprotocols FAILS the
+   *  handshake if the server answers with one it never offered, and `graphql-ws`
+   *  always offers `graphql-transport-ws`. */
+  private negotiate(headers: Record<string, string | undefined> = {}): string | undefined {
+    const raw = Object.entries(headers).find(
+      ([k]) => k.toLowerCase() === "sec-websocket-protocol",
+    )?.[1];
+    if (!raw) return undefined;
+    const offered = raw.split(",").map(s => s.trim()).filter(Boolean);
+    return offered.find(p => this.subprotocols.includes(p));
   }
 }

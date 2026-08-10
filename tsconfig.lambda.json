@@ -1,0 +1,31 @@
+/* =============================================================================
+ *  Lambda pre-compile — the one build step GraphQL forces on us.
+ * =============================================================================
+ *  SST bundles Lambdas with esbuild, and esbuild does not implement
+ *  `emitDecoratorMetadata` (it's a type-directed emit, and esbuild deliberately
+ *  doesn't type-check). Most of this repo copes by never relying on it: gateways
+ *  and services inject with an explicit `@Inject(Token)`.
+ *
+ *  @nestjs/graphql can't cope the same way — `@Args()` unconditionally reads
+ *  `design:paramtypes[index]`, so with no metadata the schema build dies during
+ *  app.init() with `Cannot read properties of undefined (reading '0')`, which
+ *  reaches the client as a bare 502 on the WebSocket handshake.
+ *
+ *  So: run the real TypeScript compiler first (it DOES emit the metadata) and
+ *  point SST's handler at the compiled JS. esbuild then just bundles JS whose
+ *  __metadata() calls are already baked in.
+ *
+ *  Output mirrors src/, so the example's `require('../../..')` still resolves to
+ *  .lambda/index.js and `require('../../../graphql')` to .lambda/graphql/index.js.
+ * ========================================================================== */
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": ".lambda",
+    "rootDir": "src",
+    "declaration": false,
+    "sourceMap": true,
+    "noEmit": false
+  },
+  "include": ["src/**/*.ts"]
+}

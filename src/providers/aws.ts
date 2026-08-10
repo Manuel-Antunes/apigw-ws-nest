@@ -122,12 +122,20 @@ export class ApiGatewayPublisher implements RealtimePublisher {
   }
 
   async toConnection(id: string, event: string, data: unknown) {
+    await this.post(id, { event, data });
+  }
+  /** Verbatim payload — used by transports with their own wire format (GraphQL). */
+  async toConnectionRaw(id: string, payload: unknown) {
+    await this.post(id, payload);
+  }
+
+  private async post(id: string, payload: unknown) {
     const { PostToConnectionCommand, GoneException } = require('@aws-sdk/client-apigatewaymanagementapi');
     try {
       await this.mgmt().send(
         new PostToConnectionCommand({
           ConnectionId: id,
-          Data: Buffer.from(JSON.stringify({ event, data })),
+          Data: Buffer.from(JSON.stringify(payload)),
         }),
       );
     } catch (err: any) {

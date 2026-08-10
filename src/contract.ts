@@ -63,10 +63,17 @@ export interface ApiGwWsEvent {
 
 /** What a route integration returns. For `$connect`, a non-2xx rejects the
  *  socket; for `$default`, the contract delivery is via the Management API, so
- *  the body here is informational. */
+ *  the body here is informational.
+ *
+ *  `headers` matters on `$connect` only, and in practice for exactly one header:
+ *  `Sec-WebSocket-Protocol`. A client that offers a subprotocol (graphql-ws
+ *  offers `graphql-transport-ws`) expects the server to echo the one it picked;
+ *  API Gateway takes that from the $connect integration response. See
+ *  GatewayBridge's subprotocol negotiation. */
 export interface ApiGwResponse {
   statusCode: number;
   body?: string;
+  headers?: Record<string, string>;
 }
 
 /** Parsed inbound frame coming from a client. Structurally identical to NestJS's

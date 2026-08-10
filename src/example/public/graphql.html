@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>graphql subscriptions · apigw-ws</title>
+<style>
+  :root{
+    --ink:#0b1014; --panel:#10171d; --line:#1d2932; --muted:#5d7080; --text:#c7d6df;
+    --inbound:#46e0c8;      /* you -> server */
+    --outbound:#f0a23c;     /* server -> you */
+    --accent:#e535ab;       /* graphql pink */
+    --live:#46e0c8; --dead:#3a4852; --bad:#ff6b6b;
+    --mono: ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans: system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--ink); color:var(--text); font-family:var(--sans); font-size:14px;
+       line-height:1.5; display:grid; grid-template-rows:auto 1fr; min-height:100%}
+
+  header{border-bottom:1px solid var(--line); padding:18px 22px; display:flex;
+         align-items:center; gap:18px; flex-wrap:wrap}
+  .brand{font-family:var(--mono); letter-spacing:.04em; font-size:13px; color:var(--muted)}
+  .brand b{color:var(--text); font-weight:600}
+  .brand .gql{color:var(--accent)}
+  .nav{font-family:var(--mono); font-size:12px; display:flex; gap:12px}
+  .nav a{color:var(--muted); text-decoration:none}
+  .nav a:hover{color:var(--inbound)}
+  .wire{flex:1; min-width:100px; height:2px; background:var(--dead); border-radius:2px; overflow:hidden}
+  .wire.live{background:linear-gradient(90deg,transparent,var(--live),transparent);
+             background-size:200% 100%; animation:flow 1.6s linear infinite}
+  @keyframes flow{from{background-position:200% 0}to{background-position:-200% 0}}
+  .status{font-family:var(--mono); font-size:12px; display:flex; align-items:center; gap:8px; white-space:nowrap}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--dead)}
+  .dot.live{background:var(--live)}
+  .dot.bad{background:var(--bad)}
+
+  main{display:grid; grid-template-columns:330px 1fr; min-height:0}
+  @media (max-width:820px){ main{grid-template-columns:1fr; grid-template-rows:auto 1fr} }
+
+  .controls{border-right:1px solid var(--line); padding:20px; display:flex;
+            flex-direction:column; gap:20px; overflow:auto}
+  .group{display:flex; flex-direction:column; gap:8px}
+  .eyebrow{font-family:var(--mono); font-size:11px; letter-spacing:.12em;
+           text-transform:uppercase; color:var(--muted)}
+  .hint{font-size:11px; color:var(--muted); line-height:1.45}
+  label{font-family:var(--mono); font-size:11px; color:var(--muted)}
+  input{width:100%; background:var(--ink); border:1px solid var(--line); color:var(--text);
+        font-family:var(--mono); font-size:13px; padding:8px 10px; border-radius:6px}
+  input:focus-visible{outline:2px solid var(--accent); outline-offset:1px; border-color:transparent}
+  button{font-family:var(--mono); font-size:12px; text-align:left; background:var(--panel);
+         color:var(--text); border:1px solid var(--line); padding:9px 11px; border-radius:6px;
+         cursor:pointer; transition:border-color .12s,color .12s}
+  button:hover:not(:disabled){border-color:var(--accent); color:var(--accent)}
+  button:disabled{opacity:.4; cursor:not-allowed}
+  button .k{color:var(--muted)}
+  .connect{background:var(--inbound); color:#04100c; border-color:var(--inbound); font-weight:600}
+  .connect.on{background:transparent; color:var(--outbound); border-color:var(--outbound)}
+  .row{display:grid; grid-template-columns:1fr auto; gap:8px; align-items:end}
+
+  /* active subscriptions */
+  .subs{display:flex; flex-direction:column; gap:6px}
+  .sub{display:flex; align-items:center; gap:8px; font-family:var(--mono); font-size:11px;
+       border:1px solid var(--line); border-radius:6px; padding:7px 9px}
+  .sub .name{color:var(--accent); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .sub .n{color:var(--muted)}
+  .sub button{padding:2px 7px; font-size:11px}
+  .empty{font-family:var(--mono); font-size:11px; color:var(--muted)}
+
+  /* log */
+  .log{min-height:0; display:flex; flex-direction:column}
+  .logbar{padding:11px 22px; border-bottom:1px solid var(--line); display:flex; gap:18px;
+          align-items:center; font-family:var(--mono); font-size:11px; color:var(--muted)}
+  .legend{display:flex; gap:14px; flex-wrap:wrap}
+  .legend span{display:flex; gap:6px; align-items:center}
+  .arrow{font-weight:700}
+  .in .arrow{color:var(--inbound)} .out .arrow{color:var(--outbound)}
+  .feed{flex:1; overflow:auto; padding:14px 22px; font-family:var(--mono); font-size:12.5px}
+  .line{display:grid; grid-template-columns:64px 16px 1fr; gap:10px; padding:5px 0;
+        border-bottom:1px solid rgba(29,41,50,.5)}
+  .t{color:var(--muted); font-size:11px}
+  .body{white-space:pre-wrap; word-break:break-word}
+  .type{color:var(--accent)}
+  .sid{color:var(--muted)}
+  .err .body{color:var(--bad)}
+  .sys .body{color:var(--muted)}
+  .banner{margin:0; padding:10px 22px; background:#2a1216; color:var(--bad);
+          font-family:var(--mono); font-size:12px; border-bottom:1px solid var(--line)}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><b>apigw-ws</b> · <span class="gql">graphql subscriptions</span></div>
+  <nav class="nav"><a href="/">monitor</a><a href="/chat">chat</a></nav>
+  <div class="wire" id="wire"></div>
+  <div class="status"><span class="dot" id="dot"></span><span id="state">idle</span></div>
+</header>
+
+<main>
+  <section class="controls">
+    <div class="group">
+      <div class="eyebrow">connection</div>
+      <div class="hint" id="url"></div>
+      <button class="connect" id="toggle">connect</button>
+    </div>
+
+    <div class="group">
+      <div class="eyebrow">subscribe</div>
+      <div class="hint">Each button opens a real <b>graphql-ws</b> subscription over the
+        API&nbsp;Gateway socket. Nothing is held in the server process — the row lives in
+        the store, so it survives a redeploy.</div>
+      <button id="subAll">postAdded <span class="k">— global topic</span></button>
+      <div class="row">
+        <div><label for="feed">feed</label><input id="feed" value="general" /></div>
+        <button id="subFeed">postAddedIn</button>
+      </div>
+      <div class="row">
+        <div><label for="term">term</label><input id="term" value="hello" /></div>
+        <button id="subTerm">postAddedMatching</button>
+      </div>
+    </div>
+
+    <div class="group">
+      <div class="eyebrow">active subscriptions</div>
+      <div class="subs" id="subs"><div class="empty">none</div></div>
+    </div>
+
+    <div class="group">
+      <div class="eyebrow">mutate / query</div>
+      <div class="hint">graphql-ws runs mutations over the same socket, so this needs no
+        HTTP endpoint at all.</div>
+      <label for="title">title</label><input id="title" value="hello world" />
+      <label for="body">body</label><input id="body" value="from graphql over api gateway" />
+      <label for="mfeed">feed (optional)</label><input id="mfeed" value="general" />
+      <button id="create">createPost <span class="k">— mutation</span></button>
+      <button id="list">posts <span class="k">— query</span></button>
+    </div>
+  </section>
+
+  <section class="log">
+    <div class="logbar">
+      <div class="legend">
+        <span class="out"><b class="arrow">←</b> server → you</span>
+        <span class="in"><b class="arrow">→</b> you → server</span>
+      </div>
+      <div style="flex:1"></div>
+      <button id="clear" style="padding:4px 9px">clear</button>
+    </div>
+    <div class="feed" id="feedLog"></div>
+  </section>
+</main>
+
+<script src="/config.js"></script>
+<script type="module">
+/* ===========================================================================
+ *  The REAL graphql-ws browser client — not a hand-rolled imitation.
+ *  That is the point of this page: if this client is satisfied, the Lambda is
+ *  genuinely speaking graphql-transport-ws, subprotocol handshake included.
+ * ======================================================================== */
+let createClient;
+try {
+  ({ createClient } = await import('https://esm.sh/graphql-ws@5.16.0'));
+} catch (err) {
+  const b = document.createElement('p');
+  b.className = 'banner';
+  b.textContent = 'could not load the graphql-ws client from esm.sh — this page needs network access. ' + err;
+  document.body.insertBefore(b, document.querySelector('main'));
+}
+
+const WS_URL = window.__WS_URL__ || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`;
+document.getElementById('url').textContent = WS_URL;
+
+const $ = (id) => document.getElementById(id);
+const feedLog = $('feedLog');
+
+function log(dir, kind, text) {
+  const line = document.createElement('div');
+  line.className = `line ${dir === '←' ? 'out' : dir === '→' ? 'in' : 'sys'} ${kind === 'error' ? 'err' : ''}`;
+  const t = new Date();
+  line.innerHTML =
+    `<span class="t">${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}:${String(t.getSeconds()).padStart(2, '0')}.${String(t.getMilliseconds()).padStart(3, '0')}</span>` +
+    `<span class="arrow">${dir}</span><span class="body"></span>`;
+  line.querySelector('.body').textContent = text;
+  feedLog.appendChild(line);
+  feedLog.scrollTop = feedLog.scrollHeight;
+}
+$('clear').onclick = () => (feedLog.innerHTML = '');
+
+/* ---- connection ---------------------------------------------------------- */
+let client = null;
+const subs = new Map(); // key -> { dispose, label, count }
+
+function setState(text, cls) {
+  $('state').textContent = text;
+  $('dot').className = `dot ${cls || ''}`;
+  $('wire').className = `wire ${cls === 'live' ? 'live' : ''}`;
+  $('toggle').textContent = client ? 'disconnect' : 'connect';
+  $('toggle').classList.toggle('on', !!client);
+  for (const id of ['subAll', 'subFeed', 'subTerm', 'create', 'list']) $(id).disabled = !client;
+}
+
+function connect() {
+  client = createClient({
+    url: WS_URL,
+    lazy: false,          // open the socket now, not on first subscribe
+    retryAttempts: 0,     // a failed handshake should be visible, not retried away
+    on: {
+      connecting: () => { setState('connecting', ''); log('·', 'sys', 'opening websocket…'); },
+      opened: (socket) => log('·', 'sys', `socket open — negotiated subprotocol: "${socket.protocol || '(none)'}"`),
+      connected: () => { setState('connected', 'live'); log('·', 'sys', 'connection_ack received'); },
+      // every server -> client message, verbatim
+      message: (msg) => {
+        if (msg.type === 'connection_ack' || msg.type === 'pong') return log('←', 'sys', msg.type);
+        const id = msg.id ? ` #${msg.id}` : '';
+        log('←', msg.type === 'error' ? 'error' : 'msg',
+            `${msg.type}${id}  ${msg.payload ? JSON.stringify(msg.payload) : ''}`);
+      },
+      closed: (e) => { setState(`closed (${e?.code ?? '?'})`, 'bad'); log('·', 'sys', `socket closed ${e?.code ?? ''} ${e?.reason ?? ''}`); },
+      error: (e) => log('·', 'error', `client error: ${e?.message ?? e}`),
+    },
+  });
+  setState('connecting', '');
+}
+
+function disconnect() {
+  for (const [, s] of subs) s.dispose();
+  subs.clear(); renderSubs();
+  client?.dispose();
+  client = null;
+  setState('idle', '');
+}
+
+$('toggle').onclick = () => (client ? disconnect() : connect());
+
+/* ---- subscriptions ------------------------------------------------------- */
+function renderSubs() {
+  const host = $('subs');
+  host.innerHTML = '';
+  if (!subs.size) { host.innerHTML = '<div class="empty">none</div>'; return; }
+  for (const [key, s] of subs) {
+    const row = document.createElement('div');
+    row.className = 'sub';
+    row.innerHTML = `<span class="name"></span><span class="n"></span><button>stop</button>`;
+    row.querySelector('.name').textContent = s.label;
+    row.querySelector('.n').textContent = `${s.count} next`;
+    row.querySelector('button').onclick = () => { s.dispose(); subs.delete(key); renderSubs(); };
+    host.appendChild(row);
+  }
+}
+
+function subscribe(key, label, query, variables) {
+  if (subs.has(key)) return log('·', 'sys', `already subscribed: ${label}`);
+  log('→', 'msg', `subscribe  ${label}`);
+  // graphql-ws mints its own message id, so count emissions here rather than
+  // trying to match ids in the `message` hook (which only logs).
+  const entry = { label, count: 0, dispose: () => {} };
+  entry.dispose = client.subscribe(
+    { query, variables },
+    {
+      next: () => { entry.count++; renderSubs(); },
+      error: (err) => log('·', 'error', `subscription ${label} errored: ${JSON.stringify(err)}`),
+      complete: () => { subs.delete(key); renderSubs(); log('·', 'sys', `${label} completed`); },
+    },
+  );
+  subs.set(key, entry);
+  renderSubs();
+}
+
+const POST_FIELDS = '{ id title body createdAt }';
+$('subAll').onclick = () =>
+  subscribe('postAdded', 'postAdded', `subscription { postAdded ${POST_FIELDS} }`);
+$('subFeed').onclick = () => {
+  const feed = $('feed').value.trim();
+  subscribe(`postAddedIn:${feed}`, `postAddedIn(feed:"${feed}")`,
+    `subscription P($feed:String!){ postAddedIn(feed:$feed) ${POST_FIELDS} }`, { feed });
+};
+$('subTerm').onclick = () => {
+  const term = $('term').value.trim();
+  subscribe(`postAddedMatching:${term}`, `postAddedMatching(term:"${term}")`,
+    `subscription P($term:String!){ postAddedMatching(term:$term) ${POST_FIELDS} }`, { term });
+};
+
+/* ---- one-shot operations (over the same socket) -------------------------- */
+function once(label, query, variables) {
+  log('→', 'msg', `${label}  ${variables ? JSON.stringify(variables) : ''}`);
+  client.subscribe({ query, variables }, { next: () => {}, error: (e) => log('·', 'error', JSON.stringify(e)), complete: () => {} });
+}
+
+$('create').onclick = () => {
+  const feed = $('mfeed').value.trim();
+  once('mutation createPost',
+    `mutation C($title:String!,$body:String!,$feed:String){ createPost(title:$title, body:$body, feed:$feed) ${POST_FIELDS} }`,
+    { title: $('title').value, body: $('body').value, feed: feed || null });
+};
+$('list').onclick = () => once('query posts', `query { posts ${POST_FIELDS} } `);
+
+setState('idle', '');
+</script>
+</body>
+</html>

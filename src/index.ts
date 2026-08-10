@@ -20,11 +20,22 @@ export { createGatewayBridge, connectionStore, publisher } from './runtime';
 // transport internals (advanced / custom wiring)
 export { ApiGatewayWsAdapter } from './ws-adapter';
 export type { ApiGatewayWsAdapterOptions } from './ws-adapter';
-export { GatewayBridge, GatewayClient, GatewayServer, GLOBAL_ROOM } from './gateway-bridge';
+export {
+  GatewayBridge,
+  GatewayClient,
+  GatewayServer,
+  GLOBAL_ROOM,
+  GRAPHQL_WS_SUBPROTOCOL,
+} from './gateway-bridge';
+export type {
+  FrameHandler,
+  DisconnectHook,
+  GatewayBridgeOptions,
+} from './gateway-bridge';
 
 // ports + contract types
 export type { ConnectionStore, RealtimePublisher, SessionMeta } from './ports';
-export { ConnectionGoneError } from './ports';
+export { ConnectionGoneError, isConnectionGone } from './ports';
 export type {
   ApiGwWsEvent,
   ApiGwResponse,

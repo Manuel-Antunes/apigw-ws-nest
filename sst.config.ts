@@ -33,6 +33,11 @@ export default $config({
     $transform(sst.aws.Function, (args) => {
       args.runtime ??= 'nodejs20.x';
       args.nodejs = {
+        // The handler we ship is tsc's CommonJS output (see tsconfig.lambda.json).
+        // SST defaults to bundling as ESM, and a CJS entry bundled to ESM exposes
+        // only `default` — Lambda then fails with
+        // `Function "handler" not found in "handler". Found default`.
+        format: 'cjs',
         esbuild: {
           // Truly-optional NestJS integrations we don't use. NOTE: do NOT add
           // '@nestjs/websockets/socket-module' here — core require()s it to
@@ -51,6 +56,16 @@ export default $config({
             'class-transformer',
             'class-validator',
             'cache-manager',
+            // @nestjs/graphql + @nestjs/apollo probe for adapters and features
+            // we don't use (fastify, federation, the ts-morph plugin). They're
+            // require()d behind feature checks, so leaving them unresolved is
+            // safe — but esbuild fails the build unless they're external.
+            '@as-integrations/fastify',
+            '@apollo/subgraph',
+            '@apollo/subgraph/package.json',
+            '@apollo/subgraph/dist/directives',
+            '@apollo/gateway',
+            'ts-morph',
           ],
         },
         ...(args.nodejs ?? {}),
@@ -84,7 +99,13 @@ export default $config({
       CHAT_TABLE: chat.name,
     };
     const route = {
-      handler: 'src/example/src/handler.handler',
+      // The COMPILED handler, not the .ts source. @nestjs/graphql's @Args()
+      // needs `design:paramtypes`, which only tsc emits — esbuild (SST's
+      // bundler) never does, and the schema build then throws at cold start,
+      // surfacing as a 502 on the WebSocket handshake. `pnpm build:lambda`
+      // produces this; `pnpm live` / `pnpm deploy` run it for you.
+      // See tsconfig.lambda.json.
+      handler: '.lambda/example/src/handler.handler',
       // link grants the Lambda IAM for each resource (DynamoDB CRUD on the tables,
       // execute-api:ManageConnections on the api). `chat` MUST be here or its
       // PutItem/Query throw AccessDeniedException.

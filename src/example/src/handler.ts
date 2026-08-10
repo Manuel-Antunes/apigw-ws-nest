@@ -6,22 +6,38 @@
  *  GatewayBridge and return the response.
  *
  *  The bridge is instantiated OUTSIDE the handler (module scope, reused across
- *  warm invocations) — a plain object, NOT pulled from the Nest DI container. The
- *  Nest app is built/initialized exactly once (createNestApp binds the gateways,
- *  incl. the rxjs topics, to this same bridge); the handler body stays trivial.
+ *  warm invocations) — a plain object, NOT pulled from the Nest DI container.
+ *
+ *  Everything below is an ordinary NestJS bootstrap; the only unusual line is
+ *  useWebSocketAdapter, exactly as you'd swap in Socket.IO's IoAdapter. (The
+ *  library also ships createNestApp(AppModule, bridge) as a shorthand for those
+ *  two lines — this spells it out so nothing is hidden.)
  * ========================================================================== */
 
-import { createNestApp, createGatewayBridge } from '../..';
+import { NestFactory } from '@nestjs/core';
+import { ApiGatewayWsAdapter, createGatewayBridge } from '../..';
+import { enableGraphQLSubscriptions } from '../../graphql';
 import { AppModule } from './app.module';
 
 // Built once per warm container, outside the DI container.
 const bridge = createGatewayBridge();
 
-// Build + init the Nest app exactly once (dedupes concurrent cold starts).
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule, { logger: ['error', 'warn'] });
+  // BEFORE init(): keeps the adapter's raw dispatch route ahead of Nest's 404
+  // catch-all, and binds the @SubscribeMessage handlers to THIS bridge.
+  app.useWebSocketAdapter(new ApiGatewayWsAdapter(app, bridge));
+  await app.init();
+  // AFTER init(): GraphQLModule has built the schema by now — which is why this
+  // is a plain call here rather than an onModuleInit somewhere.
+  enableGraphQLSubscriptions(app, bridge);
+  return app;
+}
+
+// Built exactly once per warm container (dedupes concurrent cold starts).
 let ready: Promise<unknown> | undefined;
-const ensureReady = () => (ready ??= createNestApp(AppModule, bridge).then((app) => app.init()));
 
 export const handler = async (event: any) => {
-  await ensureReady();
+  await (ready ??= bootstrap());
   return bridge.dispatch(event);
 };

@@ -13,12 +13,15 @@ import {
   PROVIDER,
   DISPATCH_PATH,
 } from "../..";
+import { enableGraphQLSubscriptions } from "../../graphql";
 import { AppModule } from "./app.module";
 
 export async function bootstrap() {
   const bridge = createGatewayBridge();
   const app = await createNestApp(AppModule, bridge);
   await app.listen(HTTP_PORT);
+  // After listen(): the schema exists by then.
+  enableGraphQLSubscriptions(app, bridge);
   // eslint-disable-next-line no-console
   console.log(
     `up on :${HTTP_PORT}  provider=${PROVIDER}  dispatch=${DISPATCH_PATH}`,
