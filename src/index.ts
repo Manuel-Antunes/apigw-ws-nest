@@ -1,5 +1,5 @@
 /* =============================================================================
- *  apigw-ws — public API
+ *  apigw-ws-nest — public API
  * =============================================================================
  *  NestJS custom WebSocketAdapter over AWS API Gateway WebSocket. Import this
  *  barrel from your app / Lambda handler / HTTP bootstrap.
@@ -8,34 +8,77 @@
  *  bridge. A @WebSocketGateway written against the standard NestJS/Socket.IO
  *  surface (@WebSocketServer, client.join, server.to().emit) needs nothing from
  *  here injected — swap the adapter and the gateway is unchanged.
+ *
+ *  Everything is reached through one object:
+ *
+ *      const bridge = GatewayBridge.builder().provider('aws').build();
+ *
+ *      bridge.dispatch(event)          // the WebSocket routes
+ *      bridge.flush(event, context)    // the outbox stream
+ *      bridge.use(protocol)            // add a wire protocol
+ *      bridge.store / .publisher / .bus
+ *
+ *  There are no module-level singletons: two bridges in one process share
+ *  nothing, and every backend is answerable at the call site.
  * ========================================================================== */
 
 import 'reflect-metadata';
 
+// the bridge and its builder
+export { GatewayBridge, GatewayBridgeBuilder, GatewayClient, GatewayServer, GLOBAL_ROOM } from './gateway-bridge';
+export type { ProtocolHandler, BridgeConfig, BoundHandler } from './gateway-bridge';
+
 // app wiring
 export { createNestApp } from './app-factory';
 export type { CreateNestAppOptions } from './app-factory';
-export { createGatewayBridge, connectionStore, publisher } from './runtime';
-
-// transport internals (advanced / custom wiring)
-export { ApiGatewayWsAdapter } from './ws-adapter';
+export { ApiGatewayWsAdapter, NestGatewayProtocol } from './ws-adapter';
 export type { ApiGatewayWsAdapterOptions } from './ws-adapter';
-export {
-  GatewayBridge,
-  GatewayClient,
-  GatewayServer,
-  GLOBAL_ROOM,
-  GRAPHQL_WS_SUBPROTOCOL,
-} from './gateway-bridge';
-export type {
-  FrameHandler,
-  DisconnectHook,
-  GatewayBridgeOptions,
-} from './gateway-bridge';
 
-// ports + contract types
-export type { ConnectionStore, RealtimePublisher, SessionMeta } from './ports';
+// durable fan-out (outbox + DynamoDB Streams)
+export {
+  Flusher,
+  DynamoOutboxBus,
+  InlineMessageBus,
+  DynamoDeliveryLedger,
+  InMemoryDeliveryLedger,
+  sealRecord,
+  outboxPk,
+  decodeStreamEvent,
+  OUTBOX_TTL_SECONDS,
+} from './outbox';
+export type {
+  FlushContext,
+  FlusherOptions,
+  StreamEvent,
+  StreamContext,
+  BatchResponse,
+} from './outbox';
+
+// ports — every swappable interface
+export type {
+  ConnectionStore,
+  RealtimePublisher,
+  MessageBus,
+  DeliveryLedger,
+  DeliveryTarget,
+  FanoutPage,
+  FanoutResolver,
+  SessionMeta,
+  Page,
+  PageCursor,
+  Broadcast,
+  RoomBroadcast,
+  TopicBroadcast,
+  OutboxRecord,
+} from './ports';
 export { ConnectionGoneError, isConnectionGone } from './ports';
+
+// providers (the built-in backends; the builder picks these via .provider())
+export { DynamoConnectionStore, ApiGatewayPublisher } from './providers/aws';
+export { InMemoryConnectionStore, LocalPublisher, LocalSocketRegistry } from './providers/local';
+export { docClient, queryAll, queryPage } from './providers/dynamo';
+
+// contract
 export type {
   ApiGwWsEvent,
   ApiGwResponse,
@@ -47,6 +90,7 @@ export { EVENT_TYPE, ROUTE } from './contract';
 
 // config
 export { PROVIDER, HTTP_PORT, DISPATCH_PATH } from './config';
+export type { Provider } from './config';
 
-// local-mode helper (used by the local emulator)
-export { LocalSocketRegistry } from './providers/local';
+// dispatch scope (advanced: making an out-of-band send awaitable)
+export { enqueueBroadcast, runInDispatchScope, DispatchScope } from './dispatch-scope';

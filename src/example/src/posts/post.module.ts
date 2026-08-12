@@ -8,9 +8,9 @@
  *  WebSocket client's post.list and vice versa.
  *
  *  Note there is NOTHING here about GraphQL subscriptions — no PubSub provider,
- *  no module. That wiring is one call at the composition root, next to
- *  createGatewayBridge(): enableGraphQLSubscriptions(app, bridge). The resolver
- *  receives the PubSub on the GraphQL context.
+ *  no module. That wiring is one call at the composition root, where the bridge
+ *  is built: enableGraphQLSubscriptions(app, bridge). The resolver receives the
+ *  PubSub on the GraphQL context.
  * ========================================================================== */
 
 import { Module } from "@nestjs/common";

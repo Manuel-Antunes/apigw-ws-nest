@@ -25,8 +25,38 @@ import { Observable, isObservable } from "rxjs";
 import { filter } from "rxjs/operators";
 import { DISPATCH_PATH } from "./config";
 import { ApiGwWsEvent, ClientFrame } from "./contract";
-import { GatewayBridge, GatewayClient, BoundHandler } from "./gateway-bridge";
-import { enqueueBroadcast } from "./broadcast-queue";
+import {
+  BoundHandler,
+  GatewayBridge,
+  GatewayClient,
+  ProtocolHandler,
+} from "./gateway-bridge";
+import { enqueueBroadcast } from "./dispatch-scope";
+
+/**
+ * The `{ event, data }` protocol, as a plug-in like any other.
+ *
+ * It is the FALLBACK: unlike graphql-transport-ws it has no frame signature to
+ * recognise (any JSON object with an `event` could be one), so it must only see
+ * what no signature-bearing protocol claimed. Routing itself lives on the client
+ * (`handleFrame`, installed by bindMessageHandlers below) because Nest binds
+ * handlers per connection, not per bridge.
+ *
+ * Registering it here rather than inside the bridge is deliberate: a bridge with
+ * no Nest adapter genuinely has no `{ event, data }` handling, and now says so.
+ */
+export class NestGatewayProtocol implements ProtocolHandler {
+  readonly name = "nest";
+  readonly fallback = true;
+
+  async handleFrame(frame: unknown, client: GatewayClient): Promise<boolean> {
+    // No handlers bound yet (no @WebSocketGateway in the app) — let the frame go
+    // unclaimed rather than silently swallowing it.
+    if (!client.handleFrame) return false;
+    await client.handleFrame(frame as ClientFrame);
+    return true;
+  }
+}
 
 export interface ApiGatewayWsAdapterOptions {
   /** Path the API Gateway HTTP integration POSTs WebSocket events to. */
@@ -42,6 +72,7 @@ export class ApiGatewayWsAdapter implements WebSocketAdapter {
   ) {
     this.httpAdapter = app.getHttpAdapter();
     this.registerDispatchRoute(options.dispatchPath ?? DISPATCH_PATH);
+    this.bridge.use(new NestGatewayProtocol());
   }
 
   /* ---- inbound: API Gateway HTTP integration, registered on the adapter ---- */

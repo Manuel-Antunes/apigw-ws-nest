@@ -1,6 +1,6 @@
 {
   "name": "apigw-ws-nest",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "description": "NestJS custom WebSocketAdapter over AWS API Gateway WebSocket + DynamoDB, with a Lambda handler and a local emulator",
   "license": "MIT",
   "author": "Manuel Antunes",
@@ -72,7 +72,8 @@
     "build:lambda": "tsc -p tsconfig.lambda.json",
     "watch:lambda": "tsc -w -p tsconfig.lambda.json",
     "test:gql": "node src/example/test/graphql-subscriptions.e2e.mjs",
-    "test:gql:aws": "LAG=6000 SKIP_RELOAD=1 node src/example/test/graphql-subscriptions.e2e.mjs"
+    "test:gql:aws": "LAG=8000 SKIP_RELOAD=1 node src/example/test/graphql-subscriptions.e2e.mjs",
+    "test:outbox": "pnpm build:js && node src/example/test/outbox.e2e.mjs"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.0",

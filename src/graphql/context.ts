@@ -25,17 +25,33 @@
  *  the runtime, not the code.
  *
  *  YOU USUALLY DON'T NEED THIS FILE. Operations arriving over the API Gateway
- *  socket get `pubsub` in their context automatically (see transport.ts) —
+ *  socket get `pubsub` in their context automatically (see handler.ts) —
  *  `@Context('pubsub')` just works. This helper is for the OTHER path: the HTTP
  *  GraphQL endpoint in ECS/HTTP mode, whose context is built by Apollo's own
  *  factory, which the WebSocket path deliberately bypasses.
  *
- *  It resolves the PubSub lazily, per request, so it can sit in
- *  GraphQLModule.forRoot(...) — evaluated at import time — while the instance
- *  itself is created later by enableGraphQLSubscriptions().
+ *  THE ORDERING PROBLEM, AND WHY YOU PASS THE INSTANCE IN. GraphQLModule.forRoot
+ *  is evaluated when your AppModule is defined — before the app exists, and long
+ *  before enableGraphQLSubscriptions() could have created anything. This used to
+ *  be solved with a module-level singleton resolved lazily at request time, which
+ *  is precisely the hidden global that made "which PubSub is this?" unanswerable.
+ *
+ *  So: create the PubSub yourself, next to the bridge, and hand it to both.
+ *
+ *      // pubsub.ts
+ *      export const pubsub = new ApiGwPubSub();
+ *
+ *      // app.module.ts
+ *      GraphQLModule.forRoot({ ..., context: apiGwPubSubContext(pubsub) })
+ *
+ *      // handler.ts
+ *      enableGraphQLSubscriptions(app, bridge, { pubsub });
+ *
+ *  Two references to one object, both visible. Nothing is resolved behind your
+ *  back, and a second bridge in the same process cannot quietly steal it.
  * ========================================================================== */
 
-import { apiGwPubSub } from './pubsub';
+import { ApiGwPubSub } from './pubsub';
 import { PUBSUB_CONTEXT_KEY } from './tokens';
 
 /**
@@ -45,17 +61,18 @@ import { PUBSUB_CONTEXT_KEY } from './tokens';
  *     GraphQLModule.forRoot<ApolloDriverConfig>({
  *       driver: ApolloDriver,
  *       autoSchemaFile: true,
- *       context: apiGwPubSubContext(),                  // or: apiGwPubSubContext(myContextFn)
+ *       context: apiGwPubSubContext(pubsub),   // or: apiGwPubSubContext(pubsub, myContextFn)
  *     })
  *
  * `pubsub` is applied last, so a stray key of the same name in your own factory
  * can't silently replace it with something that doesn't work here.
  */
 export function apiGwPubSubContext<T extends object>(
+  pubsub: ApiGwPubSub,
   context?: (...args: any[]) => T | Promise<T>,
 ) {
   return async (...args: any[]): Promise<T & Record<string, unknown>> => ({
     ...(context ? await context(...args) : ({} as T)),
-    [PUBSUB_CONTEXT_KEY]: apiGwPubSub(),
+    [PUBSUB_CONTEXT_KEY]: pubsub,
   });
 }

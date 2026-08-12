@@ -16,6 +16,7 @@ import { Module } from '@nestjs/common';
 import { GraphQLModule } from '@nestjs/graphql';
 import { ApolloDriver, ApolloDriverConfig } from '@nestjs/apollo';
 import { apiGwPubSubContext } from '../../graphql';
+import { pubsub } from './pubsub';
 import { PostModule } from './posts/post.module';
 import { ChatModule } from './chat/chat.module';
 
@@ -29,14 +30,14 @@ import { ChatModule } from './chat/chat.module';
       sortSchema: true,
       // Deliberately no `subscriptions: { 'graphql-ws': true }`: that starts
       // graphql-ws's own server on a long-lived http.Server, which is the one
-      // thing a Lambda behind API Gateway doesn't have. ApiGwPubSub takes over
-      // that role — see src/graphql/transport.ts.
+      // thing a Lambda behind API Gateway doesn't have. GraphQLWsHandler takes
+      // over that role — see src/graphql/handler.ts.
       //
       // Publishes `pubsub` on the context so resolvers use @Context('pubsub')
       // and name no transport. Only needed for the HTTP endpoint: operations
       // arriving over the socket get it automatically, since the WebSocket path
       // bypasses Apollo's request pipeline (and therefore this factory).
-      context: apiGwPubSubContext(),
+      context: apiGwPubSubContext(pubsub),
     }),
     PostModule,
     ChatModule,

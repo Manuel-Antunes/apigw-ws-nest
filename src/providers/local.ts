@@ -34,6 +34,11 @@ export class InMemoryConnectionStore implements ConnectionStore {
   async membersOf(room: string) {
     return [...(this.rooms.get(room) ?? [])];
   }
+  /** In-memory: always one page. Present so the fan-out path takes the same
+   *  branch locally as it does on DynamoDB. */
+  async pageMembersOf(room: string) {
+    return { items: await this.membersOf(room), cursor: undefined };
+  }
 }
 
 export class LocalPublisher implements RealtimePublisher {

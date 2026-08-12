@@ -1,11 +1,6 @@
 /* =============================================================================
  *  ApiGwPubSub — a PubSub that never holds a subscriber in memory.
  * =============================================================================
- *  A plain object: no decorators, no DI, no Nest lifecycle. It is created and
- *  wired by enableGraphQLSubscriptions() at the composition root, next to
- *  createGatewayBridge() — see enable.ts. Resolvers receive it on the GraphQL
- *  context (@Context('pubsub')) and never name it.
- *
  *  THE PROBLEM IT SOLVES. `graphql-subscriptions`' PubSub hands the subscription
  *  field an AsyncIterator and parks it in memory until a publish() pushes into
  *  it. On Lambda that iterator dies the moment the invocation returns, and the
@@ -14,54 +9,37 @@
  *  that "works" locally is silently dropped in production.
  *
  *  THE FIX. Never park anything. This PubSub is used in two one-shot modes, both
- *  driven from the transport through an AsyncLocalStorage so concurrent
- *  dispatches can't see each other's mode:
+ *  driven from the handler through an AsyncLocalStorage so concurrent dispatches
+ *  can't see each other's mode:
  *
  *   1. CAPTURE (on `subscribe`) — subscribe(topics) records the topic names and
- *      returns an iterable that never yields. The transport runs graphql's
+ *      returns an iterable that never yields. The handler runs graphql's
  *      createSourceEventStream() purely to LEARN the topics, then persists
  *      {connectionId, subscriptionId, topics, query, variables} in the
- *      GqlSubscriptionRegistry (DynamoDB) and throws the stream away.
+ *      GqlSubscriptionRegistry and throws the stream away.
  *
- *   2. REPLAY (on `publish`) — subscribe(topics) returns an iterable yielding
- *      exactly ONE value: the published payload. The transport re-runs
+ *   2. REPLAY (on delivery) — subscribe(topics) returns an iterable yielding
+ *      exactly ONE value: the published payload. The handler re-runs
  *      createSourceEventStream() per stored subscription, so the very same
  *      graphql machinery re-applies — crucially including `withFilter`, which
  *      Nest wraps around the field's subscribe when @Subscription({ filter }) is
  *      used. A filtered-out payload simply reports `done` and no frame is sent.
- *      Then execute() with the payload as rootValue runs the field's `resolve`
- *      and the client's selection set.
  *
  *  So the durable state is the registry row, not a live iterator — a redeploy, a
  *  scale-out, or a cold start changes nothing.
+ *
+ *  The AsyncLocalStorage is per INSTANCE, not per module: two PubSubs in one
+ *  process (two schemas, or a test) must not be able to see each other's mode.
  * ========================================================================== */
 
 import { AsyncLocalStorage } from "async_hooks";
-import { GraphQLWsTransport } from "./transport";
 import { PubSub } from "graphql-subscriptions";
 import { PubSubAsyncIterableIterator } from "graphql-subscriptions/dist/pubsub-async-iterable-iterator";
+import { MessageBus } from "../index";
+
 type Mode =
   | { kind: "capture"; topics: string[] }
   | { kind: "replay"; payload: unknown };
-
-const modeStore = new AsyncLocalStorage<Mode>();
-
-/** Run `fn` with the pubsub in capture mode; returns the topics it registered. */
-export async function captureTopics<T>(
-  fn: () => Promise<T>,
-): Promise<{ result: T; topics: string[] }> {
-  const mode: Mode = { kind: "capture", topics: [] };
-  const result = await modeStore.run(mode, fn);
-  return { result, topics: mode.topics };
-}
-
-/** Run `fn` with the pubsub replaying a single published payload. */
-export function replayPayload<T>(
-  payload: unknown,
-  fn: () => Promise<T>,
-): Promise<T> {
-  return modeStore.run({ kind: "replay", payload }, fn);
-}
 
 /** Yields nothing, ever. Enough to satisfy createSourceEventStream's
  *  "must return an AsyncIterable" assertion while we only want the topics. */
@@ -75,10 +53,10 @@ async function* once<T>(value: T): AsyncIterator<T> {
 }
 
 /**
- * A `graphql-subscriptions` PubSub whose subscriptions live in DynamoDB instead
- * of in the process. Extending the real class — rather than merely matching its
- * shape — is what lets a resolver be written against the STANDARD contract and
- * stay ignorant of this runtime:
+ * A `graphql-subscriptions` PubSub whose subscriptions live in durable storage
+ * instead of in the process. Extending the real class — rather than merely
+ * matching its shape — is what lets a resolver be written against the STANDARD
+ * contract and stay ignorant of this runtime:
  *
  *     import { PubSub } from 'graphql-subscriptions';
  *
@@ -90,25 +68,41 @@ async function* once<T>(value: T): AsyncIterator<T> {
  *     await pubsub.publish('POST_ADDED', { post });
  *
  * Nothing in that resolver names this class, so the same file runs against the
- * in-process PubSub on a long-lived server. `asyncIterator` (the v2 spelling) is
- * kept as an alias.
- *
- * Only `subscribe(trigger, onMessage)` — the callback form — cannot be honoured;
- * see the override.
+ * in-process PubSub on a long-lived server.
  */
 export class ApiGwPubSub<
-  Events extends {
-    [event: string]: unknown;
-  } = Record<string, never>,
+  Events extends { [event: string]: unknown } = Record<string, never>,
 > extends PubSub<Events> {
-  private transport?: GraphQLWsTransport;
+  private readonly modes = new AsyncLocalStorage<Mode>();
+  private bus?: MessageBus;
 
-  /** @internal — enableGraphQLSubscriptions() binds (and re-binds) the transport.
-   *  Re-binding matters: the local emulator builds a NEW bridge on every
-   *  simulated redeploy, and this instance must follow it. */
-  bindTransport(transport: GraphQLWsTransport) {
-    this.transport = transport;
+  /** @internal — GraphQLWsHandler binds the bridge's bus on attach. Re-binding
+   *  matters: the local emulator builds a NEW bridge on every simulated
+   *  redeploy, and this instance must follow it. */
+  attach(bus: MessageBus) {
+    this.bus = bus;
   }
+
+  /** True once it can publish. */
+  get attached() {
+    return !!this.bus;
+  }
+
+  /* ---- the two modes (driven by GraphQLWsHandler) ------------------------ */
+
+  /** @internal Run `fn` in capture mode; returns the topics it registered. */
+  async captureTopics<T>(fn: () => Promise<T>): Promise<{ result: T; topics: string[] }> {
+    const mode: Mode = { kind: "capture", topics: [] };
+    const result = await this.modes.run(mode, fn);
+    return { result, topics: mode.topics };
+  }
+
+  /** @internal Run `fn` replaying a single published payload. */
+  replayPayload<T>(payload: unknown, fn: () => Promise<T>): Promise<T> {
+    return this.modes.run({ kind: "replay", payload }, fn);
+  }
+
+  /* ---- the PubSub contract ----------------------------------------------- */
 
   /**
    * The ONE part of the PubSub contract that cannot be honoured here.
@@ -133,9 +127,7 @@ export class ApiGwPubSub<
           "Return pubsub.subscribe(topic) from a @Subscription() resolver instead.",
       );
     }
-    return this.asyncIterableIterator<T>(
-      triggers,
-    ) as unknown as Promise<number>;
+    return this.asyncIterableIterator<T>(triggers) as unknown as Promise<number>;
   }
 
   /**
@@ -146,11 +138,11 @@ export class ApiGwPubSub<
     triggers: string | readonly string[],
   ): PubSubAsyncIterableIterator<T> {
     const topics = typeof triggers === "string" ? [triggers] : [...triggers];
-    const mode = modeStore.getStore();
+    const mode = this.modes.getStore();
     if (!mode) {
-      // Called outside a dispatch — e.g. from the HTTP GraphQL endpoint's
-      // subscription path. There is no socket to attach to, so failing loudly
-      // beats returning a stream that never fires.
+      // Called outside a subscription dispatch — e.g. from the HTTP GraphQL
+      // endpoint. There is no socket to attach to, so failing loudly beats
+      // returning a stream that never fires.
       throw new Error(
         "ApiGwPubSub.subscribe() was called outside a WebSocket subscription dispatch. " +
           "Subscriptions must arrive over the API Gateway socket (graphql-transport-ws).",
@@ -164,25 +156,29 @@ export class ApiGwPubSub<
   }
 
   /** graphql-subscriptions v2 spelling. */
-  asyncIterator<T = unknown>(
-    triggers: string | readonly string[],
-  ): AsyncIterableIterator<T> {
+  asyncIterator<T = unknown>(triggers: string | readonly string[]): AsyncIterableIterator<T> {
     return this.asyncIterableIterator<T>(triggers);
   }
 
   /**
-   * Fan a payload out to every connection subscribed to `topic`, on every
+   * Record a payload for every connection subscribed to `topic`, on every
    * instance. Await it in your mutation: on Lambda the container freezes the
    * moment the handler returns.
+   *
+   * What is awaited is the DURABLE WRITE, not the fan-out. In aws mode this is a
+   * single PutItem into the outbox; the DynamoDB Stream then hands the whole
+   * topic to a flush invocation, which pages the subscribers and delivers them
+   * in batches, retrying until every one succeeds. See src/outbox.ts.
    */
   async publish(topic: string, payload: unknown): Promise<void> {
-    if (!this.transport) {
+    if (!this.bus) {
       throw new Error(
-        "ApiGwPubSub is not wired to a transport. Call enableGraphQLSubscriptions(app, bridge) " +
-          "after app.init(), where you build the bridge.",
+        "ApiGwPubSub is not attached to a bridge. Register the GraphQL protocol with " +
+          "bridge.use(createGraphQLWsHandler({ schema })) — or enableGraphQLSubscriptions(app, bridge) — " +
+          "before publishing.",
       );
     }
-    await this.transport.fanOut(topic, payload);
+    await this.bus.publish({ kind: "topic", topic, payload });
   }
 
   /* PubSubEngine surface. There is no in-process subscriber list to cancel —
@@ -191,27 +187,4 @@ export class ApiGwPubSub<
   unsubscribe(): void {
     /* no in-process subscription to cancel */
   }
-}
-
-/** The one instance, published into the GraphQL context. */
-let singleton: ApiGwPubSub | undefined;
-
-/** @internal — created on the first enableGraphQLSubscriptions() call. */
-export function ensureApiGwPubSub(): ApiGwPubSub {
-  return (singleton ??= new ApiGwPubSub());
-}
-
-/**
- * The PubSub handed to resolvers on the GraphQL context. Exported for services
- * that publish outside a resolver; resolvers should read `@Context('pubsub')`
- * and stay ignorant of this module.
- */
-export function apiGwPubSub(): ApiGwPubSub {
-  if (!singleton) {
-    throw new Error(
-      "GraphQL subscriptions are not enabled. Call enableGraphQLSubscriptions(app, bridge) after " +
-        "app.init(), next to createGatewayBridge().",
-    );
-  }
-  return singleton;
 }

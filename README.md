@@ -19,6 +19,8 @@ emulator, so you can develop and test the whole flow on your machine.
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Channels: global vs. scoped (rooms)](#channels-global-vs-scoped-rooms)
+- [Durable fan-out (outbox + DynamoDB Streams)](#durable-fan-out-outbox--dynamodb-streams)
+- [Protocols](#protocols)
 - [GraphQL subscriptions](#graphql-subscriptions)
 - [Gateway API](#gateway-api)
 - [Architecture](#architecture)
@@ -59,10 +61,13 @@ Socket.IO/ws.
 - **Rooms** (`client.join` / `server.to(room).emit`) — scoped, durable, cross‑instance.
 - **Global channel** (`server.emit`) — every connection, auto‑subscribed on `$connect`.
 - **[GraphQL subscriptions](#graphql-subscriptions)** — stock `@Subscription` resolvers over
-  `graphql-transport-ws`, durable across instances. One provider, no module.
+  `graphql-transport-ws`, durable across instances. One `bridge.use()`, no module.
+- **[Durable fan-out](#durable-fan-out-outbox--dynamodb-streams)** — a broadcast is recorded, then
+  delivered by a DynamoDB Stream consumer: retried until it lands, ordered per topic, deduplicated.
 - **Multiple gateways** on one connection (routes are merged, not overwritten).
 - Three runtimes: **Lambda**, **HTTP (ECS/Fargate)**, **local emulator** — one codebase.
-- Pluggable `ConnectionStore` / `RealtimePublisher` ports (DynamoDB + `@connections`, or in‑memory).
+- Four pluggable ports — `ConnectionStore`, `RealtimePublisher`, `MessageBus`, `DeliveryLedger` —
+  chosen a set at a time with `.provider()` or one at a time on the builder. No global state.
 - Ships **ESM + CJS + types**.
 
 ---
@@ -137,24 +142,27 @@ import { Module } from '@nestjs/common';
 export class AppModule {}
 ```
 
-### 3. Lambda handler
+### 3. Lambda handler — one export, every trigger
 
 An ordinary NestJS bootstrap — `NestFactory.create` plus `useWebSocketAdapter`, the same shape as
 swapping in Socket.IO's `IoAdapter`. The bridge is built **once per warm container** (outside the
-handler), the app is initialized once, and every WebSocket route (`$connect` / `$disconnect` /
-`$default`) funnels through `bridge.dispatch`.
+handler), the app is initialized once, and **`bridge.serve()` routes by event shape**: an API Gateway
+event goes to `dispatch`, a DynamoDB Stream event goes to `flush`.
 
 ```ts
 import { NestFactory } from '@nestjs/core';
-import { ApiGatewayWsAdapter, createGatewayBridge } from 'apigw-ws-nest';
+import { ApiGatewayWsAdapter, GatewayBridge } from 'apigw-ws-nest';
 import { AppModule } from './app.module';
 
-const bridge = createGatewayBridge();
+// .provider('aws') picks a matched set of backends: DynamoDB store, @connections
+// publisher, outbox bus, Dynamo delivery ledger.
+const bridge = GatewayBridge.builder().provider('aws').build();
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   // BEFORE init(): this keeps the adapter's raw dispatch route ahead of Nest's
-  // 404 catch-all, and binds the @SubscribeMessage handlers to this bridge.
+  // 404 catch-all, registers the { event, data } protocol on the bridge, and
+  // binds the @SubscribeMessage handlers to it.
   app.useWebSocketAdapter(new ApiGatewayWsAdapter(app, bridge));
   await app.init();
   return app;
@@ -162,13 +170,13 @@ async function bootstrap() {
 
 let ready: Promise<unknown> | undefined;
 
-export const handler = async (event: any) => {
+export const handler = async (event: any, context?: any) => {
   await (ready ??= bootstrap());   // dedupes concurrent cold starts
-  return bridge.dispatch(event);
+  return bridge.serve(event, context);
 };
 ```
 
-Those three lines are all `createNestApp(AppModule, bridge)` does, if you'd rather have the
+Those two middle lines are all `createNestApp(AppModule, bridge)` does, if you'd rather have the
 shorthand:
 
 ```ts
@@ -176,8 +184,50 @@ const app = await createNestApp(AppModule, bridge);
 await app.init();
 ```
 
-Point your API Gateway WebSocket `$connect`, `$disconnect`, and `$default` routes at this handler
+Point `$connect`, `$disconnect`, `$default` **and the outbox table's stream** at this one function
 (see [Deploying](#deploying-to-aws-with-sst)). That's it.
+
+### Why one function and not four
+
+SST will happily create a Function per WebSocket route plus one for the stream. Don't: they all need
+the **same booted Nest app** — fan-out re-executes a subscription per subscriber, so it needs the
+schema and the DI container — and four functions means four mostly-cold pools, each paying the
+~0.5 s Nest boot on its own.
+
+It hurts the stream consumer most. Stream traffic is bursty, so a dedicated flush function goes cold
+between bursts and pays the boot *moments after another container finished the very mutation that
+produced the record*. Measured on this repo's demo:
+
+| | invocations | cold starts |
+|---|---|---|
+| dedicated flush Function | 74 | **10 (13.5%)** |
+| shared with the WS routes | 70 | **4 (5.7%)** |
+| ...one e2e run in steady state | 38 | **0** |
+
+One pool, kept warm by the WebSocket traffic the stream records are a consequence of. The trade is a
+shared concurrency pool — a fan-out storm competes with `$connect` — and reserved concurrency is the
+lever if that ever bites.
+
+`dispatch()` and `flush()` remain public if you'd rather route them yourself.
+
+### The builder
+
+`provider()` is a shorthand for four backends at once. Any of them can be replaced individually, and
+the individual setters win regardless of call order:
+
+```ts
+const bridge = GatewayBridge.builder()
+  .provider('aws')                    // store + publisher + bus + ledger
+  .store(new MyConnectionStore())     // ...but use mine for this one
+  .publisher((store) => new MyPublisher(store))
+  .concurrency(50)                    // sends in flight per fan-out page
+  .use(someProtocol)                  // a wire protocol (see below)
+  .build();
+```
+
+The result owns everything it needs — `bridge.store`, `bridge.publisher`, `bridge.bus`,
+`bridge.flusher` — so two bridges in one process share nothing, and "which store is this?" is
+answerable at the call site. There are no module-level singletons anywhere in the library.
 
 ### Wire protocol
 
@@ -221,6 +271,127 @@ store so it survives redeploys and spans instances.
 > the global room, so a `server.emit` can't push a `{ event, data }` frame into a socket that
 > speaks something else. See [the two protocols must not cross](#the-two-protocols-must-not-cross).
 
+What you `await` on either of those calls is the **durable record of the broadcast**, not the
+fan-out — see below.
+
+---
+
+## Durable fan-out (outbox + DynamoDB Streams)
+
+`server.to(room).emit(...)` and `pubsub.publish(topic, ...)` do **not** deliver anything themselves.
+They write one row to the `Messages` table and return. That row's `INSERT` is what triggers delivery:
+
+```
+publish()  ->  PutItem (Messages)  ->  DynamoDB Stream  ->  flush Lambda
+                                                               |
+                                          page subscribers  <--+
+                                          claim + deliver each
+```
+
+### Why
+
+The obvious implementation — look the subscribers up and post to each one, right there in the
+invocation that published — has three problems that only show up in production:
+
+1. **A failed delivery was gone.** Nothing had recorded that it was owed, so nothing retried it. A
+   Lambda timeout partway through a fan-out silently dropped every remaining subscriber.
+2. **The publisher paid for every subscriber.** One mutation with 500 subscribers meant 500
+   `@connections` calls before the mutation could return.
+3. **No ordering.** Two concurrent publishes to one topic raced.
+
+A stream record is redelivered until the consumer reports success (up to 24h, then a DLQ), the
+publishing invocation now does one `PutItem` regardless of subscriber count, and because the
+partition key *is* the topic, the stream preserves order within it.
+
+### What Streams don't give you
+
+Stream delivery is **at-least-once**. A batch that fails partway is redelivered whole, so a naive
+consumer re-sends to subscribers it already served. Streams create the need for idempotency rather
+than supplying it.
+
+So the flusher keeps a **delivery ledger**: before sending to a subscriber it writes a
+`DLV#<messageId>#<key>` row with `attribute_not_exists`, and releases it if the send fails. A retry
+therefore skips whoever already received the message and re-sends only to whoever didn't. The cost
+is one conditional write per delivery.
+
+### Batching and continuation
+
+One outbox row is one topic, so **one flush invocation serves that topic's whole subscriber list**,
+in bounded-concurrency batches. If a topic is too large to finish in the time left, the flusher
+requeues the remainder under the **same `messageId`** with a cursor — so it resumes rather than
+restarts, and the ledger still suppresses the part already delivered.
+
+### The trade
+
+| | inline (before) | outbox + stream |
+|---|---|---|
+| publisher cost | O(subscribers) | O(1) — one `PutItem` |
+| delivery latency | ~10–50 ms | ~100–500 ms (measured on the demo) |
+| failed delivery | lost, silently | retried, then DLQ |
+| ordering per topic | none | FIFO |
+| duplicates | none | suppressed by the ledger |
+
+You are buying delivery certainty with latency. If that trade is wrong for a given workload, the
+publisher's `toRoom()` is still an immediate, best-effort fan-out.
+
+### Adding your own kind
+
+The outbox is agnostic — `kind` is the discriminator, and a kind is contributed by a
+[protocol](#protocols). Doing so inherits retry, ordering, batching and idempotency:
+
+```ts
+bridge.use({
+  name: 'presence',
+  handleFrame: async () => false,          // this one only fans out
+  fanout: {
+    presence: async (record, cursor) => ({
+      targets: (await whoCares(record)).map((id) => ({
+        connectionId: id,
+        key: `CONN#${id}`,                 // identity within this message, for the ledger
+        send: () => bridge.publisher.toConnection(id, 'presence', record.payload),
+      })),
+      cursor: undefined,                   // return one to be paged
+    }),
+  },
+});
+
+await bridge.publish({ kind: 'presence', payload: { userId, status: 'online' } });
+```
+
+`room` is built into the bridge (`server.to()` must work with no protocol registered); `topic` comes
+from the GraphQL protocol.
+
+---
+
+## Protocols
+
+A wire protocol is one object. The `{ event, data }` NestJS protocol and graphql-transport-ws are the
+same kind of thing — parse a frame, route it, fan out — so they register identically, and
+`dispatch()` has no special case for either:
+
+```ts
+export interface ProtocolHandler {
+  readonly name?: string;
+  readonly subprotocol?: string;                     // negotiated at $connect
+  readonly fallback?: boolean;                       // consulted last
+  readonly fanout?: Record<string, FanoutResolver>;  // outbox kinds it delivers
+  attach?(bridge: GatewayBridge): void;
+  handleFrame(frame, client, event): Promise<boolean>;   // true = it was mine
+  onDisconnect?(connectionId: string): Promise<void>;
+}
+
+bridge.use(handler);   // frames, disconnect cleanup, fan-out kinds, subprotocol — all four
+```
+
+Two consequences worth knowing:
+
+- **Subprotocols are derived, not configured.** `graphql-transport-ws` is offered at `$connect`
+  exactly when a handler declaring it is registered. Add `.subprotocols('x')` on the builder only for
+  ones no handler owns.
+- **`fallback: true` means "no frame signature".** The NestJS protocol can't recognise its own frames
+  (any JSON object with an `event` could be one), so it must only see what nobody else claimed.
+  `ApiGatewayWsAdapter` registers it for you.
+
 ---
 
 ## GraphQL subscriptions
@@ -229,19 +400,30 @@ The same socket also speaks **`graphql-transport-ws`**, so a browser's
 [`graphql-ws`](https://github.com/enisdenjo/graphql-ws) client talks to ordinary NestJS
 `@Resolver` / `@Subscription` code through API Gateway.
 
-There is **no module, no provider and no adapter to swap** — one call, where you already build
-the bridge:
+There is **no module, no provider and no adapter to swap**. It is a
+[protocol](#protocols) like any other, and the shape is
+[graphql-sse](https://github.com/enisdenjo/graphql-sse)'s: hand it the schema, register it.
+
+```ts
+import { GraphQLSchemaHost } from '@nestjs/graphql';
+import { createGraphQLWsHandler } from 'apigw-ws-nest/graphql';
+
+const { schema } = app.get(GraphQLSchemaHost);
+bridge.use(createGraphQLWsHandler({ schema }));
+```
+
+`enableGraphQLSubscriptions` is those three lines, for the common case:
 
 ```ts
 import { NestFactory } from '@nestjs/core';
-import { ApiGatewayWsAdapter, createGatewayBridge } from 'apigw-ws-nest';
+import { ApiGatewayWsAdapter, GatewayBridge } from 'apigw-ws-nest';
 import { enableGraphQLSubscriptions } from 'apigw-ws-nest/graphql';
 
-const bridge = createGatewayBridge();
+const bridge = GatewayBridge.builder().provider('aws').build();
 const app = await NestFactory.create(AppModule);
 app.useWebSocketAdapter(new ApiGatewayWsAdapter(app, bridge));
 await app.init();
-enableGraphQLSubscriptions(app, bridge);   // <- that's the whole wiring
+const pubsub = enableGraphQLSubscriptions(app, bridge);   // <- the whole wiring
 ```
 
 It goes **after** `app.init()` on purpose: `GraphQLModule` builds the schema during its own init,
@@ -255,10 +437,16 @@ which is the one thing a Lambda doesn't have:
 ```ts
 GraphQLModule.forRoot<ApolloDriverConfig>({
   driver: ApolloDriver,
-  autoSchemaFile: true,          // in memory — Lambda's filesystem is read-only outside /tmp
-  context: apiGwPubSubContext(), // optional; only for the HTTP endpoint (see below)
+  autoSchemaFile: true,                // in memory — Lambda's fs is read-only outside /tmp
+  context: apiGwPubSubContext(pubsub), // optional; only for the HTTP endpoint (see below)
 })
 ```
+
+> `forRoot` is evaluated when your `AppModule` is *defined*, before the bridge exists — so if you
+> want the HTTP endpoint to publish through the same PubSub, create it yourself in a module both can
+> import and pass it to both: `apiGwPubSubContext(pubsub)` here, and
+> `enableGraphQLSubscriptions(app, bridge, { pubsub })` there. Two visible references to one object,
+> instead of a singleton resolved behind your back.
 
 The resolver is stock NestJS and **names no transport at all**. It reads the PubSub off the GraphQL
 context and types it as `graphql-subscriptions`' own `PubSub` — `ApiGwPubSub` *extends* that class,
@@ -308,7 +496,8 @@ There is no `apigw-ws-nest` import in that file. Point the context factory at an
 and it runs unchanged on a long-lived server.
 
 Nothing in the feature module mentions subscriptions at all — `providers: [PostResolver]` and done.
-A service that needs to publish outside a resolver can import `apiGwPubSub()`.
+A service that needs to publish outside a resolver takes the same `ApiGwPubSub` instance the
+context hands resolvers — the one `enableGraphQLSubscriptions` returned.
 
 ### Why the wiring can't come from the context either
 
@@ -401,8 +590,9 @@ Three things this library had to add to the core transport for it:
 
 - **Subprotocol negotiation.** `graphql-ws` offers `Sec-WebSocket-Protocol: graphql-transport-ws`
   and a browser aborts the handshake unless the server echoes it. API Gateway takes that from the
-  `$connect` integration response, so `GatewayBridge` returns it in `headers` (configurable via
-  `createGatewayBridge({ subprotocols })`).
+  `$connect` integration response, so `GatewayBridge` returns it in `headers`. The bridge collects
+  the subprotocols from its registered protocols, so this one is offered exactly when the GraphQL
+  protocol is present.
 - **Raw sends.** graphql-ws frames are `{ type, id, payload }` and must not be wrapped in this
   library's `{ event, data }` envelope, hence `RealtimePublisher.toConnectionRaw`.
 - **Protocol isolation on the global channel** — see below.
@@ -517,12 +707,18 @@ flowchart LR
   AG -->|$connect / $disconnect / $default| L[Lambda: handler]
   L --> B[GatewayBridge.dispatch]
   B --> N[NestJS gateway @SubscribeMessage]
-  N -->|server.to / server.emit| P[RealtimePublisher]
+  N -->|"server.to / server.emit / pubsub.publish"| O[(Messages outbox)]
   B --> S[(ConnectionStore / DynamoDB)]
-  P --> S
+  O -->|DynamoDB Stream| F[Lambda: flush]
+  F -->|"who is subscribed?"| S
+  F --> P[RealtimePublisher]
   P -->|PostToConnection| AG
   AG -->|push| C
 ```
+
+Note where the arrow to the publisher is: **not** in the invocation that handled the client frame.
+Publishing records; the stream delivers. See
+[durable fan-out](#durable-fan-out-outbox--dynamodb-streams).
 
 **One frame, end to end:**
 
@@ -533,6 +729,8 @@ sequenceDiagram
   participant H as Lambda handler
   participant Br as GatewayBridge
   participant GW as Your gateway
+  participant Ob as Messages outbox
+  participant F as Lambda flush
   participant St as ConnectionStore
   participant Pub as Publisher
 
@@ -541,14 +739,22 @@ sequenceDiagram
   H->>Br: dispatch(event)
   Br->>Br: ensureClient -> emit "connection" -> Nest binds handlers
   Br->>GW: handleFrame(frame) -> @SubscribeMessage
-  GW->>Pub: server.to("room").emit(...)
-  Pub->>St: membersOf("room")
-  St-->>Pub: [connId, ...]
-  Pub->>APIGW: PostToConnection(connId, data)
-  APIGW-->>Client: push
-  Br->>Br: flushBroadcasts() (await all sends)
+  GW->>Ob: server.to("room").emit(...) = one PutItem
+  Br->>Br: flushBroadcasts() (await the durable write)
   Br-->>H: { statusCode: 200 }
+  Ob->>F: DynamoDB Stream (INSERT)
+  F->>St: pageMembersOf("room")
+  St-->>F: [connId, ...]
+  F->>F: claim delivery in the ledger
+  F->>Pub: toConnection(connId, ...)
+  Pub->>APIGW: PostToConnection
+  APIGW-->>Client: push
+  F-->>Ob: { batchItemFailures: [] }
 ```
+
+The handler returns at step 8, before anything has been delivered. If the flush fails at any point
+after that, the stream redelivers the record and the ledger keeps whoever already received it from
+receiving it twice.
 
 **The pieces** (`src/`):
 
@@ -557,14 +763,20 @@ sequenceDiagram
 - `ws-adapter.ts` — `ApiGatewayWsAdapter`: the NestJS `WebSocketAdapter`. Binds `@SubscribeMessage`
   handlers (merging across multiple gateways), turns `@Ack`/returns/`Observable`s into outbound
   sends, and registers the raw HTTP dispatch route for ECS mode.
-- `ports.ts` — `ConnectionStore` and `RealtimePublisher` interfaces (your concepts, not the
-  transport's), plus `ConnectionGoneError`.
+- `ports.ts` — every swappable interface, in one place and importing nothing: `ConnectionStore`,
+  `RealtimePublisher`, `MessageBus`, `DeliveryLedger`, the broadcast/fan-out vocabulary, and
+  `ConnectionGoneError`.
+- `outbox.ts` — the durable fan-out: buses (publish = one write), ledgers (idempotency) and
+  `Flusher` (paging, batching, continuation, 410 reaping).
 - `providers/aws.ts` — `DynamoConnectionStore` + `ApiGatewayPublisher`.
 - `providers/local.ts` — `InMemoryConnectionStore` + `LocalPublisher` (+ `LocalSocketRegistry`).
-- `runtime.ts` — memoized singletons (`connectionStore()`, `publisher()`, `createGatewayBridge()`).
+- `providers/dynamo.ts` — lazy document client and `queryAll`/`queryPage`. A DynamoDB Query stops at
+  1MB and returns a *prefix* with no error; these exist so that can't happen by omission.
 - `app-factory.ts` — `createNestApp(rootModule, bridge)`.
-- `broadcast-queue.ts` — makes fire‑and‑forget sends awaitable so the Lambda doesn't freeze
-  mid‑flight (`flushBroadcasts` runs at the end of every dispatch).
+- `dispatch-scope.ts` — makes fire‑and‑forget sends awaitable so the Lambda doesn't freeze
+  mid‑flight. Scoped to one dispatch via `AsyncLocalStorage`: it used to be a module-level array,
+  which is correct only while exactly one dispatch is in flight per process — true on Lambda, false
+  in HTTP/ECS mode, where two concurrent requests shared (and reset) each other's queue.
 
 ---
 
@@ -595,17 +807,17 @@ One gateway codebase, three ways to run it:
 
 | Mode | Entry | How frames arrive |
 |---|---|---|
-| **Lambda** (recommended) | `createGatewayBridge()` + `bridge.dispatch(event)` | API Gateway invokes the handler per frame |
+| **Lambda** (recommended) | `GatewayBridge.builder().provider('aws').build()` + `bridge.serve(event, ctx)` | one function, four triggers: the three WS routes and the outbox stream |
 | **HTTP (ECS/Fargate)** | `createNestApp(...).listen(HTTP_PORT)` | API Gateway WebSocket→HTTP integration `POST`s events to `DISPATCH_PATH` (default `/@dispatch`) |
 | **Local emulator** | `ts-node local-server.ts` | a real `ws` server emulates API Gateway and calls `dispatch` |
 
 HTTP mode example:
 
 ```ts
-import { createNestApp, createGatewayBridge, HTTP_PORT } from 'apigw-ws-nest';
+import { createNestApp, GatewayBridge, HTTP_PORT } from 'apigw-ws-nest';
 import { AppModule } from './app.module';
 
-const bridge = createGatewayBridge();
+const bridge = GatewayBridge.builder().provider('aws').build();
 const app = await createNestApp(AppModule, bridge);
 await app.listen(HTTP_PORT); // the adapter already registered POST /@dispatch
 ```
@@ -657,6 +869,14 @@ The repo includes an `sst.config.ts` that provisions everything. The shape:
 const connections = new sst.aws.Dynamo('Connections', {
   fields: { pk: 'string', sk: 'string' },
   primaryIndex: { hashKey: 'pk', rangeKey: 'sk' },
+  ttl: 'ttl',              // $disconnect backstop + delivery-ledger expiry
+});
+// The outbox. Its stream IS the delivery trigger.
+const messages = new sst.aws.Dynamo('Messages', {
+  fields: { pk: 'string', sk: 'string' },
+  primaryIndex: { hashKey: 'pk', rangeKey: 'sk' },
+  stream: 'new-image',
+  ttl: 'expiresAt',
 });
 const posts = new sst.aws.Dynamo('Posts', {
   fields: { id: 'string' }, primaryIndex: { hashKey: 'id' },
@@ -668,25 +888,50 @@ const chat = new sst.aws.Dynamo('Chat', {
 
 const api = new sst.aws.ApiGatewayWebSocket('Api');
 
-const route = {
+// ONE function. Create it explicitly, then point every trigger at its ARN —
+// passing FunctionArgs to each trigger would create a separate function per
+// trigger, and four cold pools instead of one.
+const gateway = new sst.aws.Function('Gateway', {
   handler: 'src/example/src/handler.handler',
   // link grants IAM: DynamoDB CRUD on the tables + execute-api:ManageConnections on the api.
   // EVERY table the handler touches must be here, or its calls throw AccessDenied.
-  link: [connections, posts, chat, api],
+  link: [connections, messages, posts, chat, api, dlq],
   environment: {
     RT_PROVIDER: 'aws',
     CONNECTIONS_TABLE: connections.name,
+    MESSAGES_TABLE: messages.name,
     POSTS_TABLE: posts.name,
     CHAT_TABLE: chat.name,
+    MANAGEMENT_ENDPOINT: api.managementEndpoint,
   },
-};
+  timeout: '60 seconds',
+  // Referenced by ARN, SST cannot attach the subscriber's usual permissions — so
+  // grant the stream reads here or the event source mapping fails at RUNTIME.
+  permissions: [{
+    actions: ['dynamodb:DescribeStream', 'dynamodb:GetRecords',
+              'dynamodb:GetShardIterator', 'dynamodb:ListStreams'],
+    resources: [messages.nodes.table.streamArn],
+  }],
+});
 
-api.route('$connect', route);
-api.route('$disconnect', route);
-api.route('$default', route);
+api.route('$connect', gateway.arn);
+api.route('$disconnect', gateway.arn);
+api.route('$default', gateway.arn);
+
+messages.subscribe('Flush', gateway.arn, {
+  filters: [{ eventName: ['INSERT'] }],
+  transform: {
+    eventSourceMapping: (args) => {
+      args.functionResponseTypes = ['ReportBatchItemFailures'];  // honour our return value
+      args.bisectBatchOnFunctionError = true;                    // isolate a poison record
+      args.parallelizationFactor = 10;                           // order kept per partition key
+      args.destinationConfig = { onFailure: { destinationArn: dlq.arn } };
+    },
+  },
+});
 ```
 
-Four things that bite people:
+Seven things that bite people:
 
 1. **`link` is what grants IAM.** Setting only the `environment` table name gives you the name but
    no permissions → `AccessDeniedException` on the first DynamoDB call. Every table the handler uses
@@ -699,6 +944,15 @@ Four things that bite people:
 4. **`@nestjs/graphql` probes for integrations you don't use** (fastify, federation, `ts-morph`).
    They're `require`d behind feature checks, so leaving them unresolved is fine — but esbuild fails
    the build unless they're listed in `esbuild.external`.
+5. **`functionResponseTypes` is not optional.** The flush handler returns `{ batchItemFailures }`;
+   without declaring it on the event source mapping that return value is **ignored** and any single
+   failure re-runs the whole batch.
+6. **`MANAGEMENT_ENDPOINT` must be in the environment.** A stream event carries no `requestContext`,
+   so there is no `domainName` to derive the `@connections` endpoint from. Records carry it, and
+   this is the fallback for any published outside a request.
+7. **An ARN-referenced function gets no automatic permissions.** SST attaches the stream-read policy
+   only when it *creates* the subscriber. Point a trigger at an existing ARN and you own that grant —
+   and the omission fails at runtime on the event source mapping, not at deploy.
 
 Deploy:
 
@@ -709,11 +963,14 @@ pnpm remove         # sst remove --stage dev
 
 # drive the deployed API with the real graphql-ws client
 GQL_URL='wss://<api-id>.execute-api.<region>.amazonaws.com/$default' pnpm test:gql:aws
+
+# the outbox guarantees (retry without duplication, batching, continuation, ordering)
+pnpm test:outbox
 ```
 
 The bridge sets the per‑request `@connections` management endpoint automatically from
-`event.requestContext.domainName` / `stage`, so you don't configure `MANAGEMENT_ENDPOINT` yourself in
-Lambda.
+`event.requestContext.domainName` / `stage`, so you don't configure `MANAGEMENT_ENDPOINT` yourself
+for the WebSocket routes — only for the flush function, which has no request to read it from.
 
 ---
 
@@ -729,10 +986,25 @@ interest map:
 | `CONN#<id>` | `ROOM#<room>` | reverse index — lets `remove(id)` clear *every* room on disconnect |
 | `GQLTOPIC#<topic>` | `CONN#<id>#SUB#<sub>` | a GraphQL subscription — the fan‑out lookup, carrying its query + variables |
 | `CONN#<id>` | `GQLSUB#<sub>` | reverse index for the above, so `$disconnect` can find the forward rows |
+| `DLV#<messageId>#<key>` | `DLV` | delivery ledger — written with `attribute_not_exists` before a send, so a stream retry can't duplicate it (+ `ttl`) |
 
 The global channel is just `ROOM#@@global`. The reverse rows matter: without them a disconnect (or a
 `410 Gone`) would leave a connection ghosted in rooms forever, and every later broadcast would waste
 a doomed send on it.
+
+This table is deliberately **not** streamed — it is written on every connect, join and subscribe, so
+a stream on it would be almost entirely noise. Enable **TTL on the `ttl` attribute**.
+
+**Messages table** (`MESSAGES_TABLE`, composite `pk`/`sk`) — the outbox. Needs a **stream**
+(`NEW_IMAGE`) and **TTL on `expiresAt`**:
+
+| `pk` | `sk` | meaning |
+|---|---|---|
+| `TOPIC#<topic>` | `<publishedAt>#<uuid>` | a `pubsub.publish(topic, payload)` awaiting delivery |
+| `ROOM#<room>` | `<publishedAt>#<uuid>` | a `server.to(room).emit(event, data)` awaiting delivery |
+
+One row per publish, never per subscriber. The partition key is the topic, which makes it
+simultaneously the fan-out unit, the DynamoDB partition, and the stream's ordering unit.
 
 **Chat table** (example feature, `CHAT_TABLE`, composite `pk`/`sk`):
 
@@ -750,12 +1022,13 @@ a doomed send on it.
 | Variable | Default | Used by |
 |---|---|---|
 | `RT_PROVIDER` | `local` | `local` = in‑memory store + registry; `aws` = DynamoDB + `@connections` |
-| `CONNECTIONS_TABLE` | `connections` | `DynamoConnectionStore` |
+| `CONNECTIONS_TABLE` | `connections` | `DynamoConnectionStore`, subscription registry, delivery ledger |
+| `MESSAGES_TABLE` | `messages` | the outbox (`DynamoOutboxBus`) — must have a stream |
 | `POSTS_TABLE` | `posts` | example posts repo |
 | `CHAT_TABLE` | `chat` | example chat repo |
 | `PORT` | `3000` (`HTTP_PORT`) / `6005` (emulator) | HTTP bootstrap / local emulator |
 | `APIGW_DISPATCH_PATH` | `/@dispatch` | ECS/HTTP dispatch route |
-| `MANAGEMENT_ENDPOINT` | set per‑request | `@connections` endpoint (auto‑derived in Lambda) |
+| `MANAGEMENT_ENDPOINT` | set per‑request | `@connections` endpoint (auto‑derived in Lambda; carried on each outbox record for the flush function, which has no request to derive it from) |
 | `WS_URL` | — | injected into the static test client so it knows the `wss://` URL |
 
 > `RT_PROVIDER` is read at import time — set it **before** importing anything from the library (the
@@ -765,46 +1038,77 @@ a doomed send on it.
 
 ## Public API reference
 
+Everything reachable through one object, and **no module-level singletons**:
+
+```ts
+const bridge = GatewayBridge.builder().provider('aws').build();
+
+bridge.serve(event, context)        // route by event shape — the Lambda entry point
+bridge.dispatch(event)              // ...the WebSocket half explicitly
+bridge.flush(streamEvent, context)  // ...the outbox stream half -> { batchItemFailures }
+bridge.flushRecord(record)          // deliver one record now
+bridge.publish(broadcast)           // record a broadcast (any kind)
+bridge.use(protocol)                // frames + disconnect + fan-out kinds + subprotocol
+bridge.cleanup(connectionId)        // forget a connection everywhere
+bridge.store / .publisher / .bus / .flusher / .provider / .server / .subprotocols
+```
+
 ```ts
 import {
+  // the bridge
+  GatewayBridge,          // .builder() is the entry point
+  GatewayBridgeBuilder,
+  GatewayClient, GatewayServer,
+  GLOBAL_ROOM,            // the room every {event,data} connection auto-joins on $connect
+
   // app wiring
   createNestApp,          // shorthand for NestFactory.create + useWebSocketAdapter (not initialized)
-  createGatewayBridge,    // () => GatewayBridge   (uses the memoized store + publisher)
-  connectionStore,        // () => ConnectionStore (memoized singleton)
-  publisher,              // () => RealtimePublisher (memoized singleton)
-
-  // transport (advanced / custom wiring)
   ApiGatewayWsAdapter,
-  GatewayBridge, GatewayClient, GatewayServer,
-  GLOBAL_ROOM,            // the room every connection auto-joins on $connect
+  NestGatewayProtocol,    // the {event,data} protocol; the adapter registers it for you
 
-  // ports + errors
+  // durable fan-out (the builder picks these via .provider())
+  Flusher, DynamoOutboxBus, InlineMessageBus,
+  DynamoDeliveryLedger, InMemoryDeliveryLedger,
+  sealRecord, outboxPk, decodeStreamEvent,
+
+  // built-in backends
+  DynamoConnectionStore, ApiGatewayPublisher,
+  InMemoryConnectionStore, LocalPublisher, LocalSocketRegistry,
+  docClient, queryAll, queryPage,   // a Query stops at 1MB — never read Items without these
+
+  // errors
   ConnectionGoneError,    // throw/catch to signal a dead connection (HTTP 410)
+  isConnectionGone,       // name-based check (survives duplicated bundle copies)
 
-  // contract
+  // contract + config
   EVENT_TYPE, ROUTE,      // 'CONNECT'|'MESSAGE'|'DISCONNECT' ; '$connect'|'$disconnect'|'$default'
-
-  // config + local helper
   PROVIDER, HTTP_PORT, DISPATCH_PATH,
-  LocalSocketRegistry,    // connectionId -> live socket (local mode only)
-  GRAPHQL_WS_SUBPROTOCOL, // 'graphql-transport-ws'
+
+  // advanced: make an out-of-band send awaitable within the current dispatch
+  enqueueBroadcast, runInDispatchScope, DispatchScope,
 } from 'apigw-ws-nest';
 
 // GraphQL subscriptions — separate entry point, so `graphql` is only loaded if used
 import {
-  enableGraphQLSubscriptions, // (app, bridge, opts?) => ApiGwPubSub — the whole wiring
-  apiGwPubSub,               // that instance, for publishing outside a resolver
-  apiGwPubSubContext,        // context factory for GraphQLModule.forRoot (HTTP path only)
-  PUBSUB_CONTEXT_KEY,        // 'pubsub' — the key resolvers read with @Context()
-  ApiGwPubSub,               // the class, for typing @Context('pubsub')
-  GraphQLWsTransport,        // the graphql-ws message loop; rarely touched directly
-  subscriptionRegistry,      // memoized, provider-appropriate (Dynamo | in-memory)
+  createGraphQLWsHandler,     // ({ schema, registry?, pubsub?, context? }) => GraphQLWsHandler
+  enableGraphQLSubscriptions, // (app, bridge, opts?) => ApiGwPubSub — reads the schema off the app
+  GraphQLWsHandler,           // the ProtocolHandler itself; .pubsub is on it
+  ApiGwPubSub,                // the class, for typing @Context('pubsub')
+  apiGwPubSubContext,         // context factory for GraphQLModule.forRoot (HTTP path only)
+  PUBSUB_CONTEXT_KEY,         // 'pubsub' — the key resolvers read with @Context()
+  InMemorySubscriptionRegistry, DynamoSubscriptionRegistry,
+  GRAPHQL_TRANSPORT_WS_PROTOCOL,
 } from 'apigw-ws-nest/graphql';
 
 // types
 import type {
-  ConnectionStore, RealtimePublisher, SessionMeta,
+  ProtocolHandler, BridgeConfig, Provider,
+  ConnectionStore, RealtimePublisher, MessageBus, DeliveryLedger,   // the four swappable ports
+  DeliveryTarget, FanoutPage, FanoutResolver,
+  Broadcast, RoomBroadcast, TopicBroadcast, OutboxRecord,
+  SessionMeta, Page, PageCursor,
   ApiGwWsEvent, ApiGwResponse, ApiGwRequestContext, ApiGwEventType, ClientFrame,
+  StreamEvent, StreamContext, BatchResponse, FlushContext, FlusherOptions,
   CreateNestAppOptions, ApiGatewayWsAdapterOptions,
 } from 'apigw-ws-nest';
 ```
@@ -829,8 +1133,16 @@ export interface RealtimePublisher {
 }
 ```
 
-Provide your own (Redis, Postgres, a different transport) by constructing a `GatewayBridge` with
-custom implementations instead of calling `createGatewayBridge()`.
+Provide your own (Redis, Postgres, a different transport) through the builder — each port has its
+own setter, and they override whatever `.provider()` would have supplied:
+
+```ts
+GatewayBridge.builder()
+  .provider('aws')                            // the matched set...
+  .store(new RedisConnectionStore(redis))      // ...minus this one
+  .bus(new SqsMessageBus(queueUrl))            // ...and this one
+  .build();
+```
 
 ---
 
@@ -889,12 +1201,21 @@ To cut a release: bump `version`, tag `vX.Y.Z`, and publish a GitHub Release.
 
 ## Production notes & caveats
 
-- **Global fan‑out cost.** `server.emit(...)` enumerates *every* connection (one `@connections` call
-  each), exactly like Socket.IO's `io.emit`. Past a threshold, push to SQS and parallelize the
-  delivery rather than looping inline.
+- **Global fan‑out cost.** `server.emit(...)` still reaches *every* connection (one `@connections`
+  call each), exactly like Socket.IO's `io.emit` — but that cost is now paid by the flush Lambda,
+  not by the invocation that published, and it is retried rather than lost. A topic too big for one
+  invocation is requeued with a cursor. See [durable fan-out](#durable-fan-out-outbox--dynamodb-streams).
+- **The ledger costs a write per delivery.** Exactly-once on an at-least-once stream is not free:
+  budget one conditional `PutItem` per (message, subscriber). At ~$1.25/M writes this is usually
+  noise, but it is real at broadcast scale.
+- **Deliveries can still duplicate in one window.** If the flush invocation is hard-killed between
+  claiming a delivery and completing the send, that subscriber is skipped on retry. The `reserveMs`
+  continuation exists to keep invocations from dying mid-delivery, which is what makes the window
+  small rather than routine.
 - **`$disconnect` is best‑effort.** API Gateway doesn't always deliver it. The `META` row carries a
   TTL as a backstop, and a `410 Gone` on send triggers cleanup (`remove` clears the connection's
-  rooms via the reverse index).
+  rooms via the reverse index). The `Connections` table must have TTL **enabled on the `ttl`
+  attribute** or that backstop — and the ledger's expiry — silently does nothing.
 - **Streams are per‑connection, in‑process.** An `Observable` returned from a handler only lives in
   the current container; use it for per‑connection server‑push, not cross‑client fan‑out (use rooms/
   global for that). See [the cross‑instance rule](#the-cross-instance-rule-read-this).

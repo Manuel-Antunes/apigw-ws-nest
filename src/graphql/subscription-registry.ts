@@ -22,7 +22,8 @@
  *  would replay a subscription for a socket that is long gone.
  * ========================================================================== */
 
-import { PROVIDER } from '../index';
+import { Page, PageCursor } from '../index';
+import { docClient, queryAll, queryPage } from '../providers/dynamo';
 
 /** Everything needed to re-execute one client subscription from scratch. */
 export interface GqlSubscriptionRecord {
@@ -40,6 +41,11 @@ export interface GqlSubscriptionRegistry {
   add(record: GqlSubscriptionRecord): Promise<void>;
   /** Every subscription awaiting `topic`, across every instance. */
   byTopic(topic: string): Promise<GqlSubscriptionRecord[]>;
+  /** Paged form, used by the flush path so a topic with more subscribers than
+   *  fit in one page is delivered across several invocations instead of being
+   *  loaded whole. Optional: a custom registry without it falls back to
+   *  byTopic(). */
+  pageByTopic?(topic: string, cursor?: PageCursor): Promise<Page<GqlSubscriptionRecord>>;
   /** One client `complete`. */
   remove(connectionId: string, subscriptionId: string): Promise<void>;
   /** $disconnect / 410 Gone — drop every subscription this connection held. */
@@ -67,6 +73,11 @@ export class InMemorySubscriptionRegistry implements GqlSubscriptionRegistry {
     }
     return out;
   }
+  /** In-memory: always one page. Present so the flush path takes the same branch
+   *  locally as it does on DynamoDB. */
+  async pageByTopic(topic: string) {
+    return { items: await this.byTopic(topic), cursor: undefined };
+  }
   async remove(connectionId: string, subscriptionId: string) {
     this.byConnection.get(connectionId)?.delete(subscriptionId);
   }
@@ -84,22 +95,12 @@ const forwardSk = (connectionId: string, subscriptionId: string) =>
 const reverseSk = (subscriptionId: string) => `GQLSUB#${subscriptionId}`;
 
 export class DynamoSubscriptionRegistry implements GqlSubscriptionRegistry {
-  private doc: any;
   private readonly table = process.env.CONNECTIONS_TABLE ?? 'connections';
 
   private client() {
-    if (!this.doc) {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { DynamoDBDocumentClient } = require('@aws-sdk/lib-dynamodb');
-      // GraphQL variables routinely contain undefined; drop them rather than
-      // failing the whole subscribe.
-      this.doc = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
-        marshallOptions: { removeUndefinedValues: true },
-      });
-    }
-    return this.doc;
+    // GraphQL variables routinely contain undefined; drop them rather than
+    // failing the whole subscribe.
+    return docClient('gql', { marshallOptions: { removeUndefinedValues: true } });
   }
 
   async add(record: GqlSubscriptionRecord) {
@@ -129,30 +130,43 @@ export class DynamoSubscriptionRegistry implements GqlSubscriptionRegistry {
     ]);
   }
 
-  async byTopic(topic: string) {
-    const { QueryCommand } = require('@aws-sdk/lib-dynamodb');
-    const out = await this.client().send(
-      new QueryCommand({
-        TableName: this.table,
-        KeyConditionExpression: 'pk = :pk',
-        ExpressionAttributeValues: { ':pk': topicPk(topic) },
-        // A DynamoDB Query is eventually consistent by default, and that is not
-        // survivable here: a client that subscribes and then immediately triggers
-        // a mutation can have its own row missing from this read, so the payload
-        // is dropped — permanently, since a publish is never retried. Subscribe
-        // then publish is the FIRST thing anyone does, so this shows up as
-        // "the first event never arrives" and nothing else.
-        ConsistentRead: true,
-      }),
-    );
-    return (out.Items ?? []).map((item: any) => ({
+  private topicQuery(topic: string) {
+    return {
+      TableName: this.table,
+      KeyConditionExpression: 'pk = :pk',
+      ExpressionAttributeValues: { ':pk': topicPk(topic) },
+      // A DynamoDB Query is eventually consistent by default, and that is not
+      // survivable here: a client that subscribes and then immediately triggers
+      // a mutation can have its own row missing from this read, so the payload
+      // is dropped. Subscribe then publish is the FIRST thing anyone does, so
+      // this shows up as "the first event never arrives" and nothing else.
+      ConsistentRead: true,
+    };
+  }
+
+  private static hydrate(items: any[]): GqlSubscriptionRecord[] {
+    return items.map((item: any) => ({
       connectionId: String(item.connectionId),
       subscriptionId: String(item.subscriptionId),
       topics: (item.topics ?? []) as string[],
       query: String(item.query),
       variables: item.variables ?? null,
       operationName: item.operationName ?? null,
-    })) as GqlSubscriptionRecord[];
+    }));
+  }
+
+  /** Every subscriber. Pages internally — a single Query stops at 1MB and returns
+   *  a PREFIX with no error, which here would mean the subscribers past that
+   *  point silently stop receiving anything. */
+  async byTopic(topic: string) {
+    return DynamoSubscriptionRegistry.hydrate(
+      await queryAll(this.client(), this.topicQuery(topic)),
+    );
+  }
+
+  async pageByTopic(topic: string, cursor?: PageCursor) {
+    const page = await queryPage(this.client(), this.topicQuery(topic), cursor);
+    return { items: DynamoSubscriptionRegistry.hydrate(page.items), cursor: page.cursor };
   }
 
   async remove(connectionId: string, subscriptionId: string) {
@@ -168,19 +182,17 @@ export class DynamoSubscriptionRegistry implements GqlSubscriptionRegistry {
   }
 
   async removeAll(connectionId: string) {
-    const { QueryCommand } = require('@aws-sdk/lib-dynamodb');
-    const owned = await this.client().send(
-      new QueryCommand({
-        TableName: this.table,
-        KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
-        ExpressionAttributeValues: { ':pk': connPk(connectionId), ':prefix': 'GQLSUB#' },
-        // Same reasoning as byTopic: a stale read here leaves forward rows behind,
-        // and every later publish then replays a subscription for a dead socket.
-        ConsistentRead: true,
-      }),
-    );
+    // queryAll, not one Query: a leftover forward row is replayed by every later
+    // publish to that topic, forever, against a socket that no longer exists.
+    const owned = await queryAll(this.client(), {
+      TableName: this.table,
+      KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+      ExpressionAttributeValues: { ':pk': connPk(connectionId), ':prefix': 'GQLSUB#' },
+      // Same reasoning as byTopic: a stale read here leaves forward rows behind.
+      ConsistentRead: true,
+    });
     await Promise.all(
-      (owned.Items ?? []).map((item: any) =>
+      owned.map((item: any) =>
         this.deleteRows(
           connectionId,
           String(item.sk).slice('GQLSUB#'.length),
@@ -210,21 +222,12 @@ export class DynamoSubscriptionRegistry implements GqlSubscriptionRegistry {
   }
 }
 
-let _registry: GqlSubscriptionRegistry | undefined;
-
-/**
- * Provider-appropriate registry — a PROCESS-level singleton, exactly like
- * runtime.ts's connectionStore()/publisher().
+/* There is deliberately no subscriptionRegistry() singleton here any more.
  *
- * The memoization is not an optimization, it's the contract: this registry
- * stands in for durable storage. In aws mode that's DynamoDB, which trivially
- * outlives any one Nest app. In local mode it's a Map, so it must NOT be rebuilt
- * when the app is — otherwise the local emulator's /__reload (which simulates a
- * redeploy by throwing the Nest app away) would wipe every subscription and
- * quietly stop reproducing the one failure mode this whole design exists to
- * prevent.
- */
-export function subscriptionRegistry(): GqlSubscriptionRegistry {
-  return (_registry ??=
-    PROVIDER === 'aws' ? new DynamoSubscriptionRegistry() : new InMemorySubscriptionRegistry());
-}
+ * GraphQLWsHandler defaults the registry from the bridge's provider (DynamoDB in
+ * aws mode, in-memory in local). If you rebuild the bridge while sockets stay
+ * open — which the local emulator does on every simulated redeploy — construct
+ * ONE InMemorySubscriptionRegistry yourself and pass it in each time, so the
+ * subscriptions outlive the rebuild. That used to be a hidden memoization; it is
+ * now a visible variable in the emulator, where it belongs, because "this thing
+ * must survive the app" is exactly what the local emulator exists to test. */

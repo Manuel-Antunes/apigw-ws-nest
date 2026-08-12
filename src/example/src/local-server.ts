@@ -22,16 +22,20 @@ import { WebSocketServer } from "ws";
 import { INestApplication } from "@nestjs/common";
 import {
   LocalSocketRegistry,
+  InMemoryConnectionStore,
   ApiGwWsEvent,
   EVENT_TYPE,
   ROUTE,
-  GRAPHQL_WS_SUBPROTOCOL,
   createNestApp,
-  createGatewayBridge,
   GatewayBridge,
 } from "../..";
-import { enableGraphQLSubscriptions } from "../../graphql";
+import {
+  GRAPHQL_TRANSPORT_WS_PROTOCOL,
+  InMemorySubscriptionRegistry,
+  enableGraphQLSubscriptions,
+} from "../../graphql";
 import { AppModule } from "./app.module";
+import { pubsub } from "./pubsub";
 
 /* ---------------------------------------------------------------------------
  *  "Lambda instance" lifecycle (dev-only).
@@ -39,36 +43,46 @@ import { AppModule } from "./app.module";
  *  In production each warm Lambda container is one instance; a code refresh /
  *  redeploy gives you a BRAND-NEW instance (empty in-process memory) while API
  *  Gateway keeps the existing WebSocket connections open and the durable state
- *  (connections + rooms) lives in DynamoDB.
+ *  (connections, rooms, subscriptions) lives in DynamoDB.
  *
  *  Locally we emulate that exactly: buildInstance() throws away the old Nest app
- *  + GatewayBridge (so the gateway's in-memory state — any rxjs Subjects, the
- *  bridge's client map — is wiped) and builds fresh ones, WITHOUT touching the
- *  live browser sockets (the ws server below) or the process-singleton store +
- *  LocalSocketRegistry (which stand in for DynamoDB + API Gateway @connections).
+ *  AND the old GatewayBridge — so the bridge's client map, any rxjs Subjects and
+ *  every protocol handler are reborn — while the things that stand in for
+ *  DynamoDB are created ONCE, here, and handed to each new bridge.
+ *
+ *  Those two variables below are the whole point of this file. They used to be
+ *  hidden memoized singletons inside the library, which meant the emulator was
+ *  only accidentally faithful: nothing said out loud "these must outlive the
+ *  app". Now the substitution is explicit, and if you delete either line the
+ *  cross-instance test fails immediately — which is exactly the failure a
+ *  redeploy would cause in production.
+ *
  *  Hit POST /__reload to simulate a redeploy mid-session.
  * ------------------------------------------------------------------------- */
+const store = new InMemoryConnectionStore();          // stands in for DynamoDB
+const registry = new InMemorySubscriptionRegistry();  // ...and so does this
+
 let bridge: GatewayBridge;
 let app: INestApplication | undefined;
 let instanceGen = 0;
 
 async function buildInstance() {
   const previous = app;
-  // createGatewayBridge() reuses the memoized store + publisher singletons, so
-  // room membership and live-socket routing survive — only the in-process
-  // gateway/bridge state is reborn. That's what makes this a faithful "new
-  // Lambda instance" rather than a full restart.
-  bridge = createGatewayBridge();
+  // A brand-new bridge (new client map, new flusher, new protocol handlers) over
+  // the SAME durable store — a faithful "new Lambda instance" rather than a full
+  // restart. LocalSocketRegistry, which stands in for API Gateway's @connections,
+  // is untouched, so the live browser sockets survive too.
+  bridge = GatewayBridge.builder().provider('local').store(store).build();
   const next = await createNestApp(AppModule, bridge);
   await next.init();
-  // Re-wired against the NEW bridge on every simulated redeploy. The durable
-  // registry is a process singleton, so the subscriptions themselves survive.
-  enableGraphQLSubscriptions(next, bridge);
+  // Re-registered against the NEW bridge, with the SAME registry and the same
+  // PubSub — so subscriptions taken out before the reload still deliver after it.
+  enableGraphQLSubscriptions(next, bridge, { registry, pubsub });
   app = next;
   instanceGen += 1;
   if (previous) await previous.close(); // tear the old instance down once the new one is live
   // eslint-disable-next-line no-console
-  console.log(`[instance ${instanceGen}] ready — connections + rooms preserved`);
+  console.log(`[instance ${instanceGen}] ready — connections + subscriptions preserved`);
 }
 
 /** Feed an API Gateway event into the CURRENT instance's bridge. */
@@ -171,7 +185,7 @@ async function main() {
   const wss = new WebSocketServer({
     server,
     handleProtocols: protocols =>
-      protocols.has(GRAPHQL_WS_SUBPROTOCOL) ? GRAPHQL_WS_SUBPROTOCOL : false,
+      protocols.has(GRAPHQL_TRANSPORT_WS_PROTOCOL) ? GRAPHQL_TRANSPORT_WS_PROTOCOL : false,
   });
 
   wss.on("connection", async (socket, req) => {
@@ -181,7 +195,7 @@ async function main() {
     // Let the client know its id (handy in the UI; not part of API Gateway).
     // Skipped on a graphql-transport-ws socket: that protocol is strict about
     // unknown messages and the client would close the connection on it.
-    if (socket.protocol !== GRAPHQL_WS_SUBPROTOCOL) {
+    if (socket.protocol !== GRAPHQL_TRANSPORT_WS_PROTOCOL) {
       socket.send(JSON.stringify({ event: "$connected", data: { connectionId } }));
     }
     await dispatch(

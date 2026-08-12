@@ -6,21 +6,21 @@
  *  the Nest DI container. The SDK is require()d lazily so local never loads it.
  * ========================================================================== */
 
-import { ConnectionStore, RealtimePublisher, SessionMeta, ConnectionGoneError } from '../ports';
+import {
+  ConnectionStore,
+  RealtimePublisher,
+  SessionMeta,
+  ConnectionGoneError,
+  isConnectionGone,
+  PageCursor,
+} from '../ports';
+import { docClient, queryAll, queryPage } from './dynamo';
 
 export class DynamoConnectionStore implements ConnectionStore {
-  private doc: any;
   private readonly table = process.env.CONNECTIONS_TABLE ?? 'connections';
 
   private client() {
-    if (!this.doc) {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { DynamoDBDocumentClient } = require('@aws-sdk/lib-dynamodb');
-      this.doc = DynamoDBDocumentClient.from(new DynamoDBClient({}));
-    }
-    return this.doc;
+    return docClient();
   }
 
   async add(id: string, meta: SessionMeta) {
@@ -32,20 +32,21 @@ export class DynamoConnectionStore implements ConnectionStore {
     );
   }
   async remove(id: string) {
-    const { QueryCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
+    const { DeleteCommand } = require('@aws-sdk/lib-dynamodb');
     // Drop the connection AND every room it was in. The reverse rows written by
     // join() (CONN#id / ROOM#room) let us find them with a single-partition
     // query — without them, membersOf() would keep returning this dead id
     // forever and every broadcast would waste a doomed send on it.
-    const owned = await this.client().send(
-      new QueryCommand({
-        TableName: this.table,
-        KeyConditionExpression: 'pk = :pk',
-        ExpressionAttributeValues: { ':pk': `CONN#${id}` },
-      }),
-    );
+    //
+    // queryAll, not one Query: a connection in more rooms than fit in 1MB would
+    // otherwise keep the rooms this read never saw, forever.
+    const owned = await queryAll(this.client(), {
+      TableName: this.table,
+      KeyConditionExpression: 'pk = :pk',
+      ExpressionAttributeValues: { ':pk': `CONN#${id}` },
+    });
     await Promise.all(
-      (owned.Items ?? []).flatMap((item: any) => {
+      owned.flatMap((item: any) => {
         const sk = String(item.sk);
         // Always delete the owned row (META + each ROOM# reverse row).
         const deletes = [
@@ -91,16 +92,30 @@ export class DynamoConnectionStore implements ConnectionStore {
       ),
     ]);
   }
+  private membersQuery(room: string) {
+    return {
+      TableName: this.table,
+      KeyConditionExpression: 'pk = :pk',
+      ExpressionAttributeValues: { ':pk': `ROOM#${room}` },
+      // A membership row written moments ago (client.join() during $connect) must
+      // be visible to the very next broadcast, and an eventually-consistent read
+      // can miss it — which reads as "the first message never arrived".
+      ConsistentRead: true,
+    };
+  }
+
+  private static ids(items: any[]) {
+    return items.map((i: any) => String(i.sk).replace('CONN#', ''));
+  }
+
   async membersOf(room: string) {
-    const { QueryCommand } = require('@aws-sdk/lib-dynamodb');
-    const out = await this.client().send(
-      new QueryCommand({
-        TableName: this.table,
-        KeyConditionExpression: 'pk = :pk',
-        ExpressionAttributeValues: { ':pk': `ROOM#${room}` },
-      }),
-    );
-    return (out.Items ?? []).map((i: any) => String(i.sk).replace('CONN#', ''));
+    return DynamoConnectionStore.ids(await queryAll(this.client(), this.membersQuery(room)));
+  }
+
+  /** Paged form for the fan-out path — see ConnectionStore.pageMembersOf. */
+  async pageMembersOf(room: string, cursor?: PageCursor) {
+    const page = await queryPage(this.client(), this.membersQuery(room), cursor);
+    return { items: DynamoConnectionStore.ids(page.items), cursor: page.cursor };
   }
 }
 
@@ -109,9 +124,17 @@ export class ApiGatewayPublisher implements RealtimePublisher {
   constructor(private readonly store: ConnectionStore) {}
 
   private mgmt(): any {
-    // The @connections endpoint is per domain/stage; the gateway dispatch derives
-    // it per-request (process.env.MANAGEMENT_ENDPOINT).
-    const endpoint = process.env.MANAGEMENT_ENDPOINT!;
+    // The @connections endpoint is per domain/stage. On the WebSocket path the
+    // gateway dispatch derives it per-request; on the flush path it travels with
+    // the outbox record (see Flusher.flush). Both write process.env.
+    const endpoint = process.env.MANAGEMENT_ENDPOINT;
+    if (!endpoint) {
+      throw new Error(
+        'MANAGEMENT_ENDPOINT is unset, so there is nowhere to post to. It is normally set from the ' +
+          'API Gateway event, or carried on the outbox record; a flush Lambda invoked outside both ' +
+          'needs it in the environment.',
+      );
+    }
     let c = this.clients.get(endpoint);
     if (!c) {
       const { ApiGatewayManagementApiClient } = require('@aws-sdk/client-apigatewaymanagementapi');
@@ -146,16 +169,18 @@ export class ApiGatewayPublisher implements RealtimePublisher {
     }
   }
 
+  /** IMMEDIATE, best-effort fan-out — a failed send here is logged and lost.
+   *  This is NOT the path `server.to(room).emit()` takes: that publishes to the
+   *  outbox so delivery is retried until it succeeds (see src/outbox.ts). Kept as
+   *  a primitive for callers holding the publisher directly. */
   async toRoom(room: string, event: string, data: unknown) {
     const ids = await this.store.membersOf(room);
-    // NOTE: large fan-out = N HTTP calls. Past a threshold, re-publish to SQS
-    // and let workers parallelize instead of looping here. Kept simple.
     await Promise.allSettled(
       ids.map(async (id) => {
         try {
           await this.toConnection(id, event, data);
         } catch (e) {
-          if (e instanceof ConnectionGoneError) await this.store.remove(id);
+          if (isConnectionGone(e)) await this.store.remove(id);
           else throw e;
         }
       }),

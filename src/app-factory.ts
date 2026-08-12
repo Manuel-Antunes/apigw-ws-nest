@@ -1,8 +1,8 @@
 /* =============================================================================
  *  App factory — the ordinary NestJS bootstrap, with one extra line.
  * =============================================================================
- *  This is a convenience wrapper, nothing more. It expands to exactly what you
- *  would write by hand:
+ *  A convenience wrapper, nothing more. It expands to exactly what you would
+ *  write by hand:
  *
  *      const app = await NestFactory.create(AppModule);
  *      app.useWebSocketAdapter(new ApiGatewayWsAdapter(app, bridge));
@@ -11,16 +11,11 @@
  *  ...which is the same shape as swapping in Socket.IO's IoAdapter. Use whichever
  *  reads better; there is no hidden wiring either way.
  *
- *  Generic in the root module so the library never imports the demo. The caller
- *  owns the GatewayBridge (built outside DI via createGatewayBridge) and passes
- *  it in; we hand it to the ApiGatewayWsAdapter, which both registers the inbound
- *  dispatch route on the HTTP adapter AND drives the WS message pipeline.
- *
  *  ORDER MATTERS: the adapter is constructed BEFORE init()/listen(), which keeps
- *  its raw dispatch route ahead of Nest's 404 catch-all in the Express stack.
- *  Nest still binds the @SubscribeMessage handlers to bridge.hub during init(),
- *  so the SAME bridge instance the handler dispatches into is the one the
- *  handlers are wired to.
+ *  its raw dispatch route ahead of Nest's 404 catch-all in the Express stack, and
+ *  registers the `{ event, data }` protocol on the bridge before any frame can
+ *  arrive. Nest binds the @SubscribeMessage handlers during init(), so the SAME
+ *  bridge instance the handler dispatches into is the one they are wired to.
  * ========================================================================== */
 
 import { INestApplication } from "@nestjs/common";

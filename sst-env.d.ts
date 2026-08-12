@@ -19,6 +19,18 @@ declare module "sst" {
       "name": string
       "type": "sst.aws.Dynamo"
     }
+    "FlushDlq": {
+      "type": "sst.aws.Queue"
+      "url": string
+    }
+    "Gateway": {
+      "name": string
+      "type": "sst.aws.Function"
+    }
+    "Messages": {
+      "name": string
+      "type": "sst.aws.Dynamo"
+    }
     "Posts": {
       "name": string
       "type": "sst.aws.Dynamo"
