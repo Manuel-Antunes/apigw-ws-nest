@@ -14,9 +14,13 @@
  *
  *  Scoping is BACKEND state (room membership in the ConnectionStore), not a
  *  client-side `on(...)`: the server decides who receives each message.
+ *
+ *  IDENTITY is established once, at $connect (handleConnection, run by the
+ *  adapter's lifecycle: 'connect'), and read by a guard on every later frame —
+ *  so chat.send's `from` is who the server says you are, not what you claim.
  * ========================================================================== */
 
-import { Inject } from "@nestjs/common";
+import { Inject, UnauthorizedException, UseGuards } from "@nestjs/common";
 import {
   WebSocketGateway,
   WebSocketServer,
@@ -24,20 +28,51 @@ import {
   MessageBody,
   ConnectedSocket,
   Ack,
+  OnGatewayConnection,
   WsResponse,
 } from "@nestjs/websockets";
 import { GatewayClient, GatewayServer } from "../../..";
 import { ChatService } from "./chat.service";
+import { WsUserGuard } from "./ws-user.guard";
+
+/** What handleConnection puts in client.data. Ids and claims — never tokens. */
+export interface ChatIdentity {
+  user: { name: string };
+}
+
+/** The demo's "identity provider": `?token=demo:<name>`. A real app verifies a
+ *  signed, short-lived token here. */
+const DEMO_TOKEN = /^demo:(.{1,40})$/;
 
 /** The room name for a conversation's scoped topic. Sentinel-prefixed so it
  *  can't collide with other rooms (e.g. the posts feed or the global channel). */
 const roomOf = (conversationId: string) => `conv#${conversationId}`;
 
 @WebSocketGateway()
-export class ChatGateway {
+export class ChatGateway implements OnGatewayConnection {
   @WebSocketServer() server: GatewayServer;
 
   constructor(@Inject(ChatService) private readonly chat: ChatService) {}
+
+  // Runs ONCE per connection, at $connect, awaited. Throwing refuses the socket
+  // (401 here) and nothing is stored. No token = an anonymous connection, which
+  // may read but not send (see WsUserGuard).
+  async handleConnection(client: GatewayClient<ChatIdentity>) {
+    const token = client.handshake.query.token;
+    if (!token) return;
+    const match = DEMO_TOKEN.exec(token);
+    if (!match) throw new UnauthorizedException("invalid token");
+    client.data.user = { name: match[1] }; // persisted with the connection
+    // Recorded now, applied once accepted: server.to('user:<name>') then
+    // reaches every socket this user has open.
+    await client.join(`user:${match[1]}`);
+  }
+
+  // Who the server thinks you are — on whichever instance serves the frame.
+  @SubscribeMessage("chat.whoami")
+  whoami(@ConnectedSocket() client: GatewayClient<Partial<ChatIdentity>>): WsResponse {
+    return { event: "chat.whoami", data: client.data.user ?? null };
+  }
 
   // List existing conversations (used to populate a freshly-connected client).
   @SubscribeMessage("chat.conversations")
@@ -85,13 +120,20 @@ export class ChatGateway {
   }
 
   // Send a message — persisted, then broadcast ONLY to that conversation's room.
-  // A client in a different conversation (or none) never receives it.
+  // A client in a different conversation (or none) never receives it. Only for
+  // identified connections; `from` is the identity, whatever the body claims.
+  @UseGuards(WsUserGuard)
   @SubscribeMessage("chat.send")
   async send(
-    @MessageBody() data: { conversationId: string; from: string; text: string },
+    @ConnectedSocket() client: GatewayClient<ChatIdentity>,
+    @MessageBody() data: { conversationId: string; text: string },
     @Ack() ack: (response: WsResponse) => void,
   ) {
-    const message = await this.chat.sendMessage(data);
+    const message = await this.chat.sendMessage({
+      conversationId: data.conversationId,
+      from: client.data.user.name,
+      text: data.text,
+    });
     await this.server.to(roomOf(message.conversationId)).emit("chat.message", message);
     ack({ event: "chat.send.ack", data: { id: message.id } });
   }

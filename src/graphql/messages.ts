@@ -27,7 +27,7 @@
 import {
   GRAPHQL_TRANSPORT_WS_PROTOCOL,
   MessageType,
-  isMessage,
+  validateMessage,
   type Message,
   type SubscribePayload,
 } from 'graphql-ws';
@@ -52,5 +52,12 @@ const CLIENT_SENT: ReadonlySet<string> = new Set<string>([
  * client-sent graphql-ws message falls through to @SubscribeMessage routing.
  */
 export function isClientMessage(frame: unknown): frame is Message {
-  return isMessage(frame) && CLIENT_SENT.has((frame as Message).type);
+  // validateMessage (in graphql-ws 5 and 6 alike; 6 dropped isMessage) throws
+  // on anything that is not a well-formed message.
+  try {
+    validateMessage(frame);
+  } catch {
+    return false;
+  }
+  return CLIENT_SENT.has((frame as Message).type);
 }

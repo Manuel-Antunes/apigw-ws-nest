@@ -48,6 +48,12 @@ export interface ApiGwRequestContext {
   /** present on MESSAGE events. */
   messageId?: string;
   identity?: ApiGwIdentity;
+  /** $disconnect only: the close code and reason, when API Gateway knows them. */
+  disconnectStatusCode?: number;
+  disconnectReason?: string;
+  /** Present when a Lambda REQUEST authorizer guards $connect; API Gateway
+   *  repeats it on every later route of that connection. */
+  authorizer?: Record<string, unknown>;
 }
 
 /** The event object a WebSocket route integration receives. */
@@ -57,7 +63,9 @@ export interface ApiGwWsEvent {
   body?: string;
   /** Present on $connect. */
   headers?: Record<string, string | undefined>;
+  multiValueHeaders?: Record<string, string[] | undefined>;
   queryStringParameters?: Record<string, string | undefined>;
+  multiValueQueryStringParameters?: Record<string, string[] | undefined>;
   isBase64Encoded?: boolean;
 }
 

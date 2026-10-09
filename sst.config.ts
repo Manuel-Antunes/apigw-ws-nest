@@ -49,7 +49,8 @@ export default $config({
     // integrations that we don't use — mark them external so bundling doesn't
     // fail trying to resolve them.
     $transform(sst.aws.Function, (args) => {
-      args.runtime ??= 'nodejs20.x';
+      // Nest 12 is ESM-only; 22.x is the runtime it (and require(esm)) is at home on.
+      args.runtime ??= 'nodejs22.x';
       args.nodejs = {
         // The handler we ship is tsc's CommonJS output (see tsconfig.lambda.json).
         // SST defaults to bundling as ESM, and a CJS entry bundled to ESM exposes
@@ -57,6 +58,12 @@ export default $config({
         // `Function "handler" not found in "handler". Found default`.
         format: 'cjs',
         esbuild: {
+          // Bundling Nest 12's ESM into CommonJS leaves `import.meta` empty, and
+          // @nestjs/graphql calls createRequire(import.meta.url) at load time —
+          // a cold start would die with "The argument 'filename' must be a file
+          // URL ... Received undefined". Give it this file's URL instead.
+          define: { 'import.meta.url': '__import_meta_url' },
+          banner: { js: "const __import_meta_url = require('url').pathToFileURL(__filename).href;" },
           // Truly-optional NestJS integrations we don't use. NOTE: do NOT add
           // '@nestjs/websockets/socket-module' here — core require()s it to
           // enable WebSocket gateways, so it must be BUNDLED, not external.

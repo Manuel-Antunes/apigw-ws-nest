@@ -25,11 +25,37 @@ export class DynamoConnectionStore implements ConnectionStore {
 
   async add(id: string, meta: SessionMeta) {
     const { PutCommand } = require('@aws-sdk/lib-dynamodb');
-    // ttl guards against $disconnect never firing (best-effort event).
+    // ttl guards against $disconnect never firing (best-effort event). 3h is
+    // longer than API Gateway's 2h connection limit, so `data` lives exactly as
+    // long as the connection could.
     const ttl = Math.floor(Date.now() / 1000) + 60 * 60 * 3;
-    await this.client().send(
-      new PutCommand({ TableName: this.table, Item: { pk: `CONN#${id}`, sk: 'META', ...meta, ttl } }),
+    // This client has no removeUndefinedValues, so an absent optional field
+    // (subprotocol, sourceIp, data) must be left out rather than written as
+    // undefined — which would throw.
+    const attributes = Object.fromEntries(
+      Object.entries(meta).filter(([, value]) => value !== undefined),
     );
+    await this.client().send(
+      new PutCommand({ TableName: this.table, Item: { pk: `CONN#${id}`, sk: 'META', ...attributes, ttl } }),
+    );
+  }
+  async get(id: string): Promise<SessionMeta | null> {
+    const { GetCommand } = require('@aws-sdk/lib-dynamodb');
+    const out = await this.client().send(
+      new GetCommand({
+        TableName: this.table,
+        Key: { pk: `CONN#${id}`, sk: 'META' },
+        // A frame can reach another instance right after $connect answered; an
+        // eventually-consistent read could miss the row and refuse it.
+        ConsistentRead: true,
+      }),
+    );
+    if (!out.Item) return null;
+    const { pk, sk, ttl, ...meta } = out.Item;
+    // DynamoDB deletes expired items lazily — often days later — and an expired
+    // row must not authenticate anybody.
+    if (typeof ttl === 'number' && ttl * 1000 <= Date.now()) return null;
+    return meta as SessionMeta;
   }
   async remove(id: string) {
     const { DeleteCommand } = require('@aws-sdk/lib-dynamodb');
@@ -165,6 +191,17 @@ export class ApiGatewayPublisher implements RealtimePublisher {
       if (err instanceof GoneException || err?.name === 'GoneException') {
         throw new ConnectionGoneError(id); // 410 — caller cleans up the ghost
       }
+      throw err;
+    }
+  }
+
+  /** Close the socket server-side. Already gone counts as done. */
+  async disconnect(id: string) {
+    const { DeleteConnectionCommand, GoneException } = require('@aws-sdk/client-apigatewaymanagementapi');
+    try {
+      await this.mgmt().send(new DeleteConnectionCommand({ ConnectionId: id }));
+    } catch (err: any) {
+      if (err instanceof GoneException || err?.name === 'GoneException') return;
       throw err;
     }
   }

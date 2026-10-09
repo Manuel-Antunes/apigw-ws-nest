@@ -4,8 +4,8 @@
  *  The registry is the whole reason GraphQL subscriptions survive a stateless
  *  runtime. A live AsyncIterator can't outlive a Lambda invocation, so instead we
  *  persist everything needed to RE-RUN the subscription later, from any instance:
- *  the connection, the client's subscription id, the topics it awaits, and the
- *  original document + variables.
+ *  the connection, the client's subscription id, the topics it awaits, the
+ *  original document + variables, and the connection's identity (client.data).
  *
  *  On publish the transport reads the rows for that topic and replays each one.
  *
@@ -35,6 +35,10 @@ export interface GqlSubscriptionRecord {
   query: string;
   variables?: Record<string, unknown> | null;
   operationName?: string | null;
+  /** The connection's `client.data` when it subscribed — what a replay puts in
+   *  `context.connection.data` without reading the connection back. Exact,
+   *  because data cannot change after $connect. Absent when it was empty. */
+  connectionData?: Record<string, unknown>;
 }
 
 export interface GqlSubscriptionRegistry {
@@ -152,6 +156,7 @@ export class DynamoSubscriptionRegistry implements GqlSubscriptionRegistry {
       query: String(item.query),
       variables: item.variables ?? null,
       operationName: item.operationName ?? null,
+      ...(item.connectionData ? { connectionData: item.connectionData } : {}),
     }));
   }
 

@@ -138,7 +138,11 @@
   $('connectBtn').onclick = () => {
     if (ws){ ws.close(); return; }
     myName = $('name').value || 'Anon';
-    ws = new WebSocket(WS_URL);
+    // Identity is established at $connect, from the query string (a browser
+    // cannot set headers on a WebSocket). The demo token is `demo:<name>`; a
+    // real app would hand out a short-lived, signed, single-use ticket.
+    const sep = WS_URL.includes('?') ? '&' : '?';
+    ws = new WebSocket(`${WS_URL}${sep}token=${encodeURIComponent('demo:' + myName)}`);
     ws.onopen = () => { setLive(true); send('chat.conversations'); };
     ws.onclose = () => { setLive(false); ws = null; };
     ws.onmessage = (e) => {
@@ -158,6 +162,7 @@
         renderConvs(); updateComposer();
       }
       else if (event === 'chat.left') { /* no-op in UI */ }
+      else if (event === 'exception') console.warn('server refused:', data);
       else if (event === 'chat.message') {
         // Only render messages for the conversation we're currently viewing.
         if (data.conversationId === activeConvId) addMessage(data);
@@ -168,7 +173,8 @@
   $('createBtn').onclick = () => send('chat.create', { title: $('convTitle').value || 'untitled' });
   $('sendBtn').onclick = () => {
     const text = $('msgText').value; if (!text || !activeConvId) return;
-    send('chat.send', { conversationId: activeConvId, from: myName, text });
+    // No `from`: the server attributes the message to who you connected as.
+    send('chat.send', { conversationId: activeConvId, text });
     $('msgText').value = '';
   };
   $('msgText').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('sendBtn').click(); });
