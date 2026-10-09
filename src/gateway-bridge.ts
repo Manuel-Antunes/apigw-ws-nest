@@ -17,6 +17,13 @@
  *  graphql-transport-ws are the same kind of thing — parse a frame, route it, fan
  *  out — so they register the same way, through bridge.use(). dispatch() has no
  *  special case for either.
+ *
+ *  $CONNECT IS A DECISION, THEN A WRITE. With a connect hook registered (the
+ *  builder's onConnect, a protocol's onConnect, or the Nest adapter routing to
+ *  handleConnection), the hooks run first and nothing reaches the store unless
+ *  they all accept. Identity is written to `client.data`, persisted with the
+ *  connection, and rehydrated from the store on whichever instance serves the
+ *  next frame — so a guard reads the same thing everywhere.
  * ========================================================================== */
 
 import { EventEmitter } from "events";
@@ -30,7 +37,9 @@ import {
   OutboxRecord,
   PageCursor,
   RealtimePublisher,
+  SessionMeta,
   isConnectionGone,
+  isConnectionRejected,
 } from "./ports";
 import {
   ApiGwWsEvent,
@@ -40,7 +49,7 @@ import {
   ROUTE,
 } from "./contract";
 import { PROVIDER, Provider } from "./config";
-import { runInDispatchScope } from "./dispatch-scope";
+import { enqueueBroadcast, runInDispatchScope } from "./dispatch-scope";
 import {
   BatchResponse,
   DynamoDeliveryLedger,
@@ -63,12 +72,144 @@ export type BoundHandler = MessageMappingProperties & {
   isAckHandledManually?: boolean;
 };
 
+/* ---- the handshake ------------------------------------------------------- */
+
+/**
+ * What the client presented at $connect — Socket.IO's `socket.handshake`.
+ *
+ * COMPLETE ONLY DURING THE CONNECT PHASE. Once the connection is accepted it is
+ * reduced — on the connecting instance too — to what is persisted with it, so a
+ * client looks the same on every instance. A guard reading
+ * `handshake.headers.authorization` therefore fails at once in development,
+ * instead of passing on the warm container and failing on scale-out. Raw
+ * headers are deliberately never persisted: they are the bearer tokens.
+ */
+export interface Handshake {
+  /** Header names lower-cased (as Node and Socket.IO do). Connect phase only. */
+  headers: Record<string, string>;
+  /** queryStringParameters, undefined values dropped. Connect phase only. */
+  query: Record<string, string>;
+  /** Every subprotocol the client offered, in order. A bearer smuggled as an
+   *  entry is readable here and never echoed (negotiation only picks registered
+   *  ones). Connect phase only. */
+  subprotocols: string[];
+  /** The subprotocol the bridge accepted and echoed, if any. Persisted. */
+  subprotocol?: string;
+  /** requestContext.identity.sourceIp. Persisted. */
+  sourceIp?: string;
+  /** requestContext.identity.userAgent. Connect phase only. */
+  userAgent?: string;
+  /** requestContext.connectedAt, else when $connect was handled. Persisted. */
+  connectedAt: number;
+  /** requestContext.authorizer, when an API Gateway Lambda authorizer ran. API
+   *  Gateway repeats it on every route, so it survives the reduction. */
+  authorizer?: Record<string, unknown>;
+}
+
+/** Read the handshake off a $connect event. Pure: nothing is written. */
+export function handshakeOf(event: ApiGwWsEvent): Handshake {
+  const ctx = event.requestContext;
+  const headers: Record<string, string> = {};
+  for (const [name, values] of Object.entries(event.multiValueHeaders ?? {})) {
+    if (values?.length) headers[name.toLowerCase()] = values.join(", ");
+  }
+  for (const [name, value] of Object.entries(event.headers ?? {})) {
+    if (value !== undefined) headers[name.toLowerCase()] = value;
+  }
+  const query: Record<string, string> = {};
+  for (const [name, values] of Object.entries(event.multiValueQueryStringParameters ?? {})) {
+    if (values?.length) query[name] = values[values.length - 1];
+  }
+  for (const [name, value] of Object.entries(event.queryStringParameters ?? {})) {
+    if (value !== undefined) query[name] = value;
+  }
+  return {
+    headers,
+    query,
+    subprotocols: (headers["sec-websocket-protocol"] ?? "")
+      .split(",")
+      .map(s => s.trim())
+      .filter(Boolean),
+    sourceIp: ctx.identity?.sourceIp,
+    userAgent: ctx.identity?.userAgent ?? headers["user-agent"],
+    connectedAt: ctx.connectedAt ?? Date.now(),
+    authorizer: ctx.authorizer,
+  };
+}
+
+/** The handshake every instance sees once $connect is over: only what is
+ *  persisted with the connection (plus the authorizer context, which API
+ *  Gateway itself repeats on every route). */
+function persistedHandshake(from: {
+  connectedAt: number;
+  subprotocol?: string;
+  sourceIp?: string;
+  authorizer?: Record<string, unknown>;
+}): Handshake {
+  return {
+    headers: {},
+    query: {},
+    subprotocols: [],
+    connectedAt: from.connectedAt,
+    ...(from.subprotocol ? { subprotocol: from.subprotocol } : {}),
+    ...(from.sourceIp ? { sourceIp: from.sourceIp } : {}),
+    ...(from.authorizer ? { authorizer: from.authorizer } : {}),
+  };
+}
+
 /* ---- the synthetic socket ------------------------------------------------ */
 
+/** 'connecting' while $connect hooks run, 'refused' once one of them called
+ *  disconnect(), 'open' once accepted (and for any client no connect phase
+ *  created). */
+export type ClientPhase = "connecting" | "refused" | "open";
+
+export interface GatewayClientOptions<TData extends object = Record<string, any>> {
+  handshake?: Handshake;
+  data?: TData;
+  /** Rebuilt from the store rather than created by $connect on this instance. */
+  rehydrated?: boolean;
+  /** 'connecting' records joins/leaves and refuses sends until accepted. */
+  phase?: "connecting" | "open";
+  /** What disconnect() does on an open connection. The bridge passes its own
+   *  disconnect(), so handleDisconnect and the store cleanup run too; without
+   *  it, only the publisher's disconnect() is called. */
+  kick?: () => Promise<void>;
+}
+
+/** Bookkeeping for a client whose $connect is still being decided. Kept beside
+ *  the client, keyed by it, so none of it is public surface: only the client
+ *  and the bridge in this module read it. */
+interface ConnectAttempt {
+  /** join()/leave() calls, applied in order once the connection is accepted —
+   *  a refused connection must leave no room rows behind. */
+  memberships: Array<{ room: string; join: boolean }>;
+  /** disconnect() was called: refuse with 403. */
+  refused: boolean;
+}
+const attempts = new WeakMap<GatewayClient<any>, ConnectAttempt>();
+
+/** Clients whose 'connection' event the bridge is emitting right now. The
+ *  adapter's handleConnection shim reads it to tell Nest's fire-and-forget call
+ *  apart from any other. */
+const announcing = new WeakSet<object>();
+
+/** @internal — true while the bridge is announcing this client to Nest. */
+export const isAnnouncing = (client: object): boolean => announcing.has(client);
+
+/** Make a send awaited by the current dispatch even when its caller drops the
+ *  promise. Nest's exception filter answers with an un-awaited client.emit(),
+ *  and on Lambda an un-awaited send can be frozen mid-flight. The caller still
+ *  gets the very same promise. */
+function track<T>(promise: Promise<T>): Promise<T> {
+  enqueueBroadcast(promise);
+  return promise;
+}
+
 /** Synthetic per-connection socket. Mirrors the Socket.IO client API used inside
- *  gateways (connectionId, join/leave, emit) — rooms are persisted by the store,
- *  delivery goes through the publisher. */
-export class GatewayClient {
+ *  gateways (connectionId, handshake, data, join/leave, emit, disconnect) —
+ *  rooms are persisted by the store, delivery goes through the publisher. */
+export class GatewayClient<TData extends object = Record<string, any>> {
   /** Awaitable frame processor installed by the adapter's bindMessageHandlers.
    *  Resolves only AFTER the handler ran and every response was sent. */
   handleFrame?: (frame: ClientFrame) => Promise<void>;
@@ -80,19 +221,53 @@ export class GatewayClient {
   /** Live rxjs subscriptions opened by streaming handlers (Observable returns). */
   readonly subscriptions: Subscription[] = [];
 
+  /** Socket.IO's socket.handshake. See {@link Handshake} for what survives
+   *  $connect. */
+  handshake: Handshake;
+
+  /** Socket.IO's socket.data — where identity lives. Writable while $connect is
+   *  being decided; persisted with the connection when it is accepted;
+   *  deep-frozen after that on every instance (a write throws), because a change
+   *  made here would exist on one container only. `{}` when nothing was set.
+   *  Keep ids and claims in it, not secrets: it is stored in clear. */
+  data: TData;
+
+  /** true when this object was rebuilt from the store rather than created by
+   *  $connect on this instance. */
+  readonly rehydrated: boolean;
+
+  private readonly kick?: () => Promise<void>;
+
   constructor(
     readonly connectionId: string,
     private readonly store: ConnectionStore,
     private readonly publisher: RealtimePublisher,
-  ) {}
+    options: GatewayClientOptions<TData> = {},
+  ) {
+    this.handshake = options.handshake ?? persistedHandshake({ connectedAt: Date.now() });
+    this.data = options.data ?? ({} as TData);
+    this.rehydrated = options.rehydrated ?? false;
+    this.kick = options.kick;
+    if (options.phase === "connecting") {
+      attempts.set(this, { memberships: [], refused: false });
+    }
+  }
+
+  get phase(): ClientPhase {
+    const attempt = attempts.get(this);
+    if (!attempt) return "open";
+    return attempt.refused ? "refused" : "connecting";
+  }
 
   /** Send a frame back to THIS connection (used by the adapter for acks). */
   send(frame: ClientFrame) {
-    return this.publisher.toConnection(this.connectionId, frame.event, frame.data);
+    this.assertAccepted("send");
+    return track(this.publisher.toConnection(this.connectionId, frame.event, frame.data));
   }
   /** Send a payload to THIS connection VERBATIM — no `{ event, data }` envelope.
    *  For protocols that own their wire format (see src/graphql). */
   sendRaw(payload: unknown) {
+    this.assertAccepted("sendRaw");
     if (!this.publisher.toConnectionRaw) {
       return Promise.reject(
         new Error(
@@ -100,19 +275,96 @@ export class GatewayClient {
         ),
       );
     }
-    return this.publisher.toConnectionRaw(this.connectionId, payload);
+    return track(this.publisher.toConnectionRaw(this.connectionId, payload));
   }
   /** Socket.IO-style: emit an event to THIS connection. */
   emit(event: string, data: unknown) {
-    return this.publisher.toConnection(this.connectionId, event, data);
+    this.assertAccepted("emit");
+    return track(this.publisher.toConnection(this.connectionId, event, data));
   }
-  /** Socket.IO-style: join / leave a room (persisted by the store). */
+  /** Socket.IO-style: join / leave a room (persisted by the store). During
+   *  $connect the call is recorded and applied once the connection is accepted. */
   join(room: string) {
+    const attempt = attempts.get(this);
+    if (attempt) {
+      attempt.memberships.push({ room, join: true });
+      return Promise.resolve();
+    }
     return this.store.join(this.connectionId, room);
   }
   leave(room: string) {
+    const attempt = attempts.get(this);
+    if (attempt) {
+      attempt.memberships.push({ room, join: false });
+      return Promise.resolve();
+    }
     return this.store.leave(this.connectionId, room);
   }
+  /** Socket.IO's socket.disconnect(true). While $connect is being decided it
+   *  refuses the connection (403); afterwards it closes the socket server-side. */
+  disconnect(): Promise<void> {
+    const attempt = attempts.get(this);
+    if (attempt) {
+      attempt.refused = true;
+      return Promise.resolve();
+    }
+    if (this.kick) return this.kick();
+    if (!this.publisher.disconnect) {
+      return Promise.reject(
+        new Error("this RealtimePublisher does not implement disconnect(); it cannot close a socket"),
+      );
+    }
+    return this.publisher.disconnect(this.connectionId);
+  }
+
+  private assertAccepted(method: string) {
+    if (attempts.has(this)) {
+      throw new Error(
+        `client.${method}() during $connect: API Gateway does not deliver to a connection whose ` +
+          `$connect has not completed. Send from a later frame, or broadcast with ` +
+          `server.to(room).emit().`,
+      );
+    }
+  }
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const inner of Object.values(value)) deepFreeze(inner);
+  }
+  return value;
+}
+
+/** Make client.data read-only — deep-frozen, and the property itself not
+ *  reassignable — so a write after $connect throws instead of quietly creating
+ *  state that exists on one instance only. */
+function sealData(client: GatewayClient<any>, data: Record<string, unknown>) {
+  Object.defineProperty(client, "data", {
+    value: deepFreeze(data),
+    enumerable: true,
+    writable: false,
+    configurable: false,
+  });
+}
+
+/** client.data as every instance will see it: a JSON round trip (so a Date is an
+ *  ISO string on the connecting instance too, not only after rehydration),
+ *  bounded in size. Over the bound is a programming error, not a refusal. */
+function normaliseData(data: unknown, maxBytes: number): Record<string, unknown> {
+  const json = JSON.stringify(data ?? {}) ?? "{}";
+  const bytes = Buffer.byteLength(json, "utf8");
+  if (bytes > maxBytes) {
+    throw new Error(
+      `client.data is ${bytes} bytes of JSON, over maxConnectionData (${maxBytes}). Keep ids and ` +
+        `claims in it, not documents or tokens.`,
+    );
+  }
+  const value = JSON.parse(json);
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("client.data must be a plain object");
+  }
+  return value;
 }
 
 /** The room EVERY `{ event, data }` connection is auto-joined to on $connect. It
@@ -205,10 +457,54 @@ export interface ProtocolHandler {
     client: GatewayClient,
     event: ApiGwWsEvent,
   ): boolean | Promise<boolean>;
-  /** $disconnect / 410 Gone — runs BEFORE the store row is dropped, so durable
-   *  state belonging to this connection can still be read to clean it up. */
-  onDisconnect?(connectionId: string): void | Promise<void>;
+  /** $connect, before anything is persisted and after the builder's onConnect
+   *  hooks. Throw (or call client.disconnect()) to refuse the socket; write
+   *  client.data to establish identity. Registering a protocol that has one
+   *  requires ConnectionStore.get(). */
+  onConnect?(client: GatewayClient, event: ApiGwWsEvent): void | Promise<void>;
+  /** $disconnect / 410 Gone / bridge.disconnect() — runs BEFORE the store row is
+   *  dropped, so durable state belonging to this connection can still be read
+   *  to clean it up. `client` is absent when this instance has none and the
+   *  store no longer knows the connection. */
+  onDisconnect?(
+    connectionId: string,
+    client?: GatewayClient,
+    reason?: string,
+  ): void | Promise<void>;
 }
+
+/** A framework-agnostic connect hook: runs at $connect before anything is
+ *  persisted. Throw (a ConnectionRejectedError, a Nest HttpException, anything)
+ *  or call client.disconnect() to refuse; write client.data to establish
+ *  identity. */
+export type ConnectHook = (client: GatewayClient, event: ApiGwWsEvent) => void | Promise<void>;
+
+/** How a connect hook's throw becomes a $connect status — by SHAPE, never by
+ *  instanceof, so the core needs no Nest import and a duplicated bundle copy of
+ *  an exception class still maps. Anything unrecognised fails closed (500). */
+function connectStatusOf(err: any): number {
+  const isClientError = (s: number) => Number.isInteger(s) && s >= 400 && s <= 499;
+  if (isConnectionRejected(err)) {
+    const status = Number(err.statusCode);
+    return Number.isInteger(status) && status >= 400 && status <= 599 ? status : 500;
+  }
+  if (typeof err?.getStatus === "function") {
+    // A Nest HttpException: UnauthorizedException, ForbiddenException, ...
+    const status = Number(err.getStatus());
+    return isClientError(status) ? status : 500;
+  }
+  if (typeof err?.getError === "function") {
+    // A Nest WsException: new WsException({ status: 403, message }) picks its
+    // status; any other WsException means "not authenticated".
+    const inner = err.getError();
+    const status = Number(inner?.status ?? inner?.statusCode);
+    return isClientError(status) ? status : 401;
+  }
+  return 500;
+}
+
+/** Answered when a connect hook outlives `connectTimeout`. */
+const CONNECT_TIMEOUT = Symbol("connect timeout");
 
 /* ---- the bridge ---------------------------------------------------------- */
 
@@ -222,6 +518,11 @@ export interface BridgeConfig {
   subprotocols?: string[];
   concurrency?: number;
   reserveMs?: number;
+  /** Bound on the whole $connect hook chain, in ms (default 10s); past it the
+   *  connection is refused with 503. */
+  connectTimeout?: number;
+  /** Ceiling on `client.data`'s UTF-8 JSON size, in bytes (default 16 KiB). */
+  maxConnectionData?: number;
 }
 
 export class GatewayBridge {
@@ -235,8 +536,16 @@ export class GatewayBridge {
   readonly flusher: Flusher;
 
   private readonly clients = new Map<string, GatewayClient>();
+  /** Rehydrations in flight, so two concurrent frames of one connection (HTTP
+   *  mode) cost one store read and one 'connection' emission. */
+  private readonly rehydrating = new Map<string, Promise<GatewayClient | undefined>>();
+  /** Clients Nest has been told about ('connection' emitted) on this instance. */
+  private readonly announced = new WeakSet<GatewayClient>();
   private readonly protocols: ProtocolHandler[] = [];
+  private readonly connectHooks: ConnectHook[] = [];
   private readonly extraSubprotocols: string[];
+  private readonly connectTimeout: number;
+  private readonly maxConnectionData: number;
 
   /** Use {@link GatewayBridge.builder}. Public so a caller who genuinely wants to
    *  assemble the parts by hand can, but the builder is the supported path. */
@@ -245,12 +554,14 @@ export class GatewayBridge {
     this.store = config.store;
     this.publisher = config.publisher;
     this.extraSubprotocols = config.subprotocols ?? [];
+    this.connectTimeout = config.connectTimeout ?? 10_000;
+    this.maxConnectionData = config.maxConnectionData ?? 16 * 1024;
     this.bus = config.bus(this);
     this.server = new GatewayServer(() => this.bus);
     this.flusher = new Flusher({
       ledger: config.ledger,
       bus: () => this.bus,
-      onConnectionGone: id => this.cleanup(id),
+      onConnectionGone: id => this.cleanup(id, "gone"),
       concurrency: config.concurrency,
       reserveMs: config.reserveMs,
     });
@@ -263,15 +574,34 @@ export class GatewayBridge {
     return new GatewayBridgeBuilder();
   }
 
-  /** Register a protocol: its frames, its disconnect cleanup, its fan-out kinds
-   *  and its subprotocol, in one call. */
+  /** Register a protocol: its frames, its connect/disconnect hooks, its fan-out
+   *  kinds and its subprotocol, in one call. */
   use(handler: ProtocolHandler): this {
+    if (handler.onConnect) {
+      this.assertRehydratable(`bridge.use(${handler.name ?? "protocol"})`);
+    }
     this.protocols.push(handler);
     for (const [kind, resolver] of Object.entries(handler.fanout ?? {})) {
       this.flusher.register(kind, resolver);
     }
     handler.attach?.(this);
     return this;
+  }
+
+  /** Register a framework-agnostic connect hook. Hooks run at $connect, in
+   *  registration order and before every protocol's onConnect. */
+  onConnect(hook: ConnectHook): this {
+    this.assertRehydratable("onConnect()");
+    this.connectHooks.push(hook);
+    return this;
+  }
+
+  /** true when $connect runs a connect phase — any connect hook is registered,
+   *  which includes the Nest adapter's default `lifecycle: 'connect'`. Without
+   *  one, $connect accepts unconditionally and frames are served without a
+   *  store read. */
+  get hasConnectHooks(): boolean {
+    return this.connectHooks.length > 0 || this.protocols.some(p => !!p.onConnect);
   }
 
   /** Every subprotocol the bridge can negotiate: whatever the registered
@@ -335,8 +665,10 @@ export class GatewayBridge {
 
     try {
       if (isConnect) {
+        if (this.hasConnectHooks) return await this.connect(event);
+        // No connect hook: accept unconditionally.
         // Echo the negotiated subprotocol, or the browser aborts the handshake.
-        const accepted = this.negotiate(event.headers);
+        const accepted = this.negotiate(handshakeOf(event).subprotocols);
         await this.store.add(connectionId, {
           connectedAt: Date.now(),
           ...(accepted ? { subprotocol: accepted } : {}),
@@ -357,13 +689,17 @@ export class GatewayBridge {
           : { statusCode: 200 };
       }
       if (isDisconnect) {
-        await this.cleanup(connectionId);
+        await this.cleanup(
+          connectionId,
+          event.requestContext.disconnectReason || "disconnect",
+        );
         return { statusCode: 200 };
       }
 
       // Any other route = a message frame.
       return await runInDispatchScope(async () => {
-        const client = this.ensureClient(connectionId);
+        const client = await this.materialize(connectionId, event);
+        if (!client) return this.refuseUnknown(connectionId);
         const parsed: unknown = event.body
           ? JSON.parse(event.body)
           : { event: routeKey, data: {} };
@@ -431,21 +767,56 @@ export class GatewayBridge {
 
   /* ---- lifecycle --------------------------------------------------------- */
 
-  /** Lazily materialize a conduit. Works on ANY instance because the durable
-   *  truth is in the store — the local map is disposable. */
-  ensureClient(connectionId: string): GatewayClient {
+  /** Lazily materialize a conduit, without reading the store. Works on ANY
+   *  instance because the durable truth is in the store — the local map is
+   *  disposable. Kept for compatibility: with connect hooks registered the
+   *  MESSAGE path uses {@link materialize}, which rehydrates `client.data`. */
+  ensureClient(connectionId: string, event?: ApiGwWsEvent): GatewayClient {
     let client = this.clients.get(connectionId);
     if (!client) {
-      client = new GatewayClient(connectionId, this.store, this.publisher);
+      client = new GatewayClient(connectionId, this.store, this.publisher, {
+        handshake: persistedHandshake({
+          connectedAt: event?.requestContext.connectedAt ?? Date.now(),
+          sourceIp: event?.requestContext.identity?.sourceIp,
+          authorizer: event?.requestContext.authorizer,
+        }),
+        kick: () => this.disconnect(connectionId),
+      });
       this.clients.set(connectionId, client);
-      this.server.emit("connection", client); // -> Nest calls bindMessageHandlers
     }
-    return client;
+    return this.announce(client); // -> Nest calls bindMessageHandlers
+  }
+
+  /**
+   * The client a frame belongs to: the cached one, else — when connect hooks
+   * are registered — one rebuilt from the store, so `client.data` reads the same
+   * on every instance. undefined when the store does not know the connection
+   * (never accepted, or expired).
+   *
+   * Costs one strongly-consistent read per (instance, connection), not per
+   * frame: `data` cannot change after $connect, so the cached copy can't go
+   * stale.
+   */
+  async materialize(
+    connectionId: string,
+    event?: ApiGwWsEvent,
+  ): Promise<GatewayClient | undefined> {
+    if (!this.hasConnectHooks) return this.ensureClient(connectionId, event);
+    const cached = this.clients.get(connectionId);
+    if (cached) return this.announce(cached);
+    let pending = this.rehydrating.get(connectionId);
+    if (!pending) {
+      pending = this.rehydrate(connectionId, event).finally(() =>
+        this.rehydrating.delete(connectionId),
+      );
+      this.rehydrating.set(connectionId, pending);
+    }
+    return pending;
   }
 
   async onSendError(client: GatewayClient, err: unknown) {
     if (isConnectionGone(err)) {
-      await this.cleanup(client.connectionId); // 410 — the socket is a ghost
+      await this.cleanup(client.connectionId, "gone"); // 410 — the socket is a ghost
     } else {
       // eslint-disable-next-line no-console
       console.error("[send error]", err); // -> DLQ in production
@@ -453,20 +824,221 @@ export class GatewayBridge {
   }
 
   /** Forget a connection everywhere: protocol state first (those hooks still need
-   *  its store rows), then the store row itself, then in-process leftovers. */
-  async cleanup(connectionId: string) {
+   *  its store rows, and see the client with its data), then the store row
+   *  itself, then in-process leftovers. `reason` is the $disconnect reason,
+   *  'gone' after a 410, or 'server disconnect' after {@link disconnect}. */
+  async cleanup(connectionId: string, reason = "disconnect") {
+    const cached = this.clients.get(connectionId);
+    let client = cached;
+    if (!client && this.hasConnectHooks) {
+      try {
+        client = await this.restore(connectionId);
+      } catch (err) {
+        // A disconnect cannot be refused: clean up without the client.
+        // eslint-disable-next-line no-console
+        console.error("[disconnect: rehydrate]", err);
+      }
+    }
     for (const protocol of this.protocols) {
       try {
-        await protocol.onDisconnect?.(connectionId);
+        await protocol.onDisconnect?.(connectionId, client, reason);
       } catch (err) {
         // eslint-disable-next-line no-console
         console.error(`[disconnect: ${protocol.name ?? "protocol"}]`, err);
       }
     }
     await this.store.remove(connectionId); // also drops it from all rooms
-    const gone = this.clients.get(connectionId);
-    gone?.subscriptions.forEach(s => s.unsubscribe()); // tear down live streams
+    cached?.subscriptions.forEach(s => s.unsubscribe()); // tear down live streams
     this.clients.delete(connectionId);
+  }
+
+  /** Close a connection server-side — a kick. Runs the same cleanup as
+   *  $disconnect first (protocols' onDisconnect see `client.data`, with reason
+   *  'server disconnect'), then has the publisher drop the socket. A
+   *  $disconnect that follows finds nothing left to clean. */
+  async disconnect(connectionId: string): Promise<void> {
+    if (!this.publisher.disconnect) {
+      throw new Error(
+        "bridge.disconnect(): this RealtimePublisher does not implement disconnect(), so it cannot close a socket",
+      );
+    }
+    await this.cleanup(connectionId, "server disconnect");
+    await this.publisher.disconnect(connectionId);
+  }
+
+  /* ---- the connect phase ------------------------------------------------- */
+
+  /** $connect with connect hooks registered: decide, then persist — never the
+   *  other way round. */
+  private async connect(event: ApiGwWsEvent): Promise<ApiGwResponse> {
+    const { connectionId } = event.requestContext;
+    const handshake = handshakeOf(event);
+    // Negotiated BEFORE the hooks: it is a pure function of the headers and the
+    // registered protocols, and protocol-specific auth needs to know which
+    // protocol the socket will speak. Nothing is written until accept().
+    const accepted = this.negotiate(handshake.subprotocols);
+    if (accepted) handshake.subprotocol = accepted;
+    const client = new GatewayClient(connectionId, this.store, this.publisher, {
+      handshake,
+      phase: "connecting",
+      kick: () => this.disconnect(connectionId),
+    });
+
+    const refusal = await runInDispatchScope(() => this.decide(client, event));
+    if (refusal) return refusal;
+
+    try {
+      await this.accept(client);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[connect: accept]", err);
+      // A connection that cannot be recorded whole is not accepted.
+      await this.store.remove(connectionId).catch(() => {});
+      return { statusCode: 500, body: "connect failed" };
+    }
+    return accepted
+      ? { statusCode: 200, headers: { "Sec-WebSocket-Protocol": accepted } }
+      : { statusCode: 200 };
+  }
+
+  /** Run every connect hook under `connectTimeout`: the builder's in
+   *  registration order, then each protocol's in routing order. The first
+   *  throw (or client.disconnect()) stops the chain. Resolves to the refusal
+   *  to answer with, or undefined to accept. */
+  private async decide(
+    client: GatewayClient,
+    event: ApiGwWsEvent,
+  ): Promise<ApiGwResponse | undefined> {
+    let step = "onConnect";
+    const chain = (async () => {
+      for (const hook of this.connectHooks) {
+        step = hook.name || "onConnect";
+        await hook(client, event);
+        if (client.phase === "refused") return;
+      }
+      for (const protocol of this.orderedProtocols()) {
+        if (!protocol.onConnect) continue;
+        step = protocol.name ?? "protocol";
+        await protocol.onConnect(client, event);
+        if (client.phase === "refused") return;
+      }
+    })();
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<typeof CONNECT_TIMEOUT>(resolve => {
+      timer = setTimeout(() => resolve(CONNECT_TIMEOUT), this.connectTimeout);
+    });
+    try {
+      if ((await Promise.race([chain, expired])) === CONNECT_TIMEOUT) {
+        // eslint-disable-next-line no-console
+        console.error(`[connect: ${step}] timed out after ${this.connectTimeout}ms`);
+        return { statusCode: 503, body: "connect failed" };
+      }
+    } catch (err) {
+      const statusCode = connectStatusOf(err);
+      if (statusCode >= 500) {
+        // eslint-disable-next-line no-console
+        console.error(`[connect: ${step}]`, err);
+        return { statusCode, body: "connect failed" };
+      }
+      // 4xx is expected traffic: answered, not logged.
+      const message = String((err as any)?.message || "connection rejected");
+      return { statusCode, body: message.slice(0, 200) };
+    } finally {
+      clearTimeout(timer);
+    }
+    return client.phase === "refused"
+      ? { statusCode: 403, body: "connection refused" }
+      : undefined;
+  }
+
+  /** Persist an accepted connection — META with its data, the global room,
+   *  then the memberships its hooks recorded, in order — and make the client
+   *  look the way every other instance will see it. */
+  private async accept(client: GatewayClient): Promise<void> {
+    const { connectionId, handshake } = client;
+    const data = normaliseData(client.data, this.maxConnectionData);
+    const meta: SessionMeta = {
+      connectedAt: handshake.connectedAt,
+      ...(handshake.subprotocol ? { subprotocol: handshake.subprotocol } : {}),
+      ...(handshake.sourceIp ? { sourceIp: handshake.sourceIp } : {}),
+      ...(Object.keys(data).length ? { data } : {}),
+    };
+    await this.store.add(connectionId, meta);
+    // Same rule as without hooks: only `{ event, data }` sockets join it.
+    if (!handshake.subprotocol) await this.store.join(connectionId, GLOBAL_ROOM);
+    for (const { room, join } of attempts.get(client)?.memberships ?? []) {
+      await (join
+        ? this.store.join(connectionId, room)
+        : this.store.leave(connectionId, room));
+    }
+    attempts.delete(client);
+    client.handshake = persistedHandshake({ ...meta, authorizer: handshake.authorizer });
+    sealData(client, data);
+    // Cached, but Nest hears about it on the first frame, as before.
+    this.clients.set(connectionId, client);
+  }
+
+  private async rehydrate(
+    connectionId: string,
+    event?: ApiGwWsEvent,
+  ): Promise<GatewayClient | undefined> {
+    const client = await this.restore(connectionId, event);
+    if (!client) return undefined;
+    // An accept on this instance may have cached one while we read.
+    const existing = this.clients.get(connectionId);
+    if (existing) return this.announce(existing);
+    this.clients.set(connectionId, client);
+    return this.announce(client);
+  }
+
+  /** Rebuild a client from its META row; undefined when there is none. */
+  private async restore(
+    connectionId: string,
+    event?: ApiGwWsEvent,
+  ): Promise<GatewayClient | undefined> {
+    if (!this.store.get) throw new Error(REHYDRATE_NEEDS_GET);
+    const meta = await this.store.get(connectionId);
+    if (!meta) return undefined;
+    const client = new GatewayClient(connectionId, this.store, this.publisher, {
+      handshake: persistedHandshake({ ...meta, authorizer: event?.requestContext.authorizer }),
+      rehydrated: true,
+      kick: () => this.disconnect(connectionId),
+    });
+    sealData(client, meta.data ?? {});
+    return client;
+  }
+
+  /** Tell Nest about a client, once per instance: the 'connection' hub event is
+   *  what binds the gateways' @SubscribeMessage handlers to it. */
+  private announce(client: GatewayClient): GatewayClient {
+    if (!this.announced.has(client)) {
+      this.announced.add(client);
+      announcing.add(client);
+      try {
+        this.server.emit("connection", client);
+      } finally {
+        announcing.delete(client);
+      }
+    }
+    return client;
+  }
+
+  /** A frame from a connection no connect phase accepted (or whose row
+   *  expired): routed nowhere, answered 403, and closed. */
+  private async refuseUnknown(connectionId: string): Promise<ApiGwResponse> {
+    // eslint-disable-next-line no-console
+    console.warn(`[dispatch] frame from unknown connection ${connectionId} — refused`);
+    await this.publisher
+      .disconnect?.(connectionId)
+      .catch(err => console.error("[disconnect]", err));
+    return { statusCode: 403, body: "unknown connection" };
+  }
+
+  private assertRehydratable(what: string) {
+    if (typeof this.store.get !== "function") {
+      throw new Error(`${what}: ${REHYDRATE_NEEDS_GET}`);
+    }
   }
 
   /* ---- internals --------------------------------------------------------- */
@@ -499,19 +1071,18 @@ export class GatewayBridge {
    *  forwards the client's Sec-WebSocket-Protocol header to $connect and sends
    *  whatever we echo back; a browser that offered subprotocols FAILS the
    *  handshake if the server answers with one it never offered. */
-  private negotiate(headers: Record<string, string | undefined> = {}): string | undefined {
-    const raw = Object.entries(headers).find(
-      ([k]) => k.toLowerCase() === "sec-websocket-protocol",
-    )?.[1];
-    if (!raw) return undefined;
+  private negotiate(offered: string[]): string | undefined {
     const accepted = this.subprotocols;
-    return raw
-      .split(",")
-      .map(s => s.trim())
-      .filter(Boolean)
-      .find(p => accepted.includes(p));
+    return offered.find(p => accepted.includes(p));
   }
 }
+
+/** ConnectionStore.get() is required by the type since 3.0; this catches a store
+ *  written for 2.x that reaches the bridge anyway (plain JavaScript, a cast) at
+ *  boot rather than on the first frame of a cold instance. */
+const REHYDRATE_NEEDS_GET =
+  "connect hooks need ConnectionStore.get() to rehydrate client.data on other instances, " +
+  "and the configured store has none (get() is required since apigw-ws-nest 3.0)";
 
 /* ---- the builder --------------------------------------------------------- */
 
@@ -546,6 +1117,7 @@ const PRESETS: Record<
  *       .provider('aws')                  // preset: store + publisher + bus + ledger
  *       .store(new MyConnectionStore())   // ...or override any of them individually
  *       .use(new SomeProtocol())
+ *       .onConnect(authenticate)          // refuse or identify at $connect
  *       .build();
  *
  * `provider()` picks a matched SET of four backends; the individual setters win
@@ -561,8 +1133,11 @@ export class GatewayBridgeBuilder {
   private _ledger?: DeliveryLedger;
   private _subprotocols: string[] = [];
   private _protocols: ProtocolHandler[] = [];
+  private _connectHooks: ConnectHook[] = [];
   private _concurrency?: number;
   private _reserveMs?: number;
+  private _connectTimeout?: number;
+  private _maxConnectionData?: number;
 
   /** Choose a matched set of backends. Defaults to `RT_PROVIDER`, or 'local'. */
   provider(provider: Provider): this {
@@ -602,6 +1177,13 @@ export class GatewayBridgeBuilder {
     return this;
   }
 
+  /** Register a connect hook. Repeatable; hooks run in registration order,
+   *  before every protocol's onConnect. Equivalent to bridge.onConnect(). */
+  onConnect(hook: ConnectHook): this {
+    this._connectHooks.push(hook);
+    return this;
+  }
+
   /** Extra subprotocols to accept beyond those the registered protocols declare. */
   subprotocols(...subprotocols: string[]): this {
     this._subprotocols.push(...subprotocols);
@@ -621,7 +1203,24 @@ export class GatewayBridgeBuilder {
     return this;
   }
 
-  build(): GatewayBridge {
+  /** Bound on the whole $connect hook chain (default 10s). A hook stuck on a
+   *  dead identity provider is answered 503 well before API Gateway's 29s. */
+  connectTimeout(ms: number): this {
+    this._connectTimeout = ms;
+    return this;
+  }
+
+  /** Ceiling on `client.data`'s UTF-8 JSON size (default 16 KiB). A ceiling,
+   *  not a target: it is written with every connection. */
+  maxConnectionData(bytes: number): this {
+    this._maxConnectionData = bytes;
+    return this;
+  }
+
+  /** Build the bridge — or a subclass of it, for whoever still needs one. */
+  build(): GatewayBridge;
+  build<B extends GatewayBridge>(ctor: new (config: BridgeConfig) => B): B;
+  build(ctor: new (config: BridgeConfig) => GatewayBridge = GatewayBridge): GatewayBridge {
     const preset = PRESETS[this._provider];
     if (!preset) {
       throw new Error(
@@ -635,7 +1234,7 @@ export class GatewayBridgeBuilder {
         : (this._publisher ?? preset.publisher(store));
     const bus = this._bus;
 
-    const bridge = new GatewayBridge({
+    const bridge = new ctor({
       provider: this._provider,
       store,
       publisher,
@@ -649,8 +1248,11 @@ export class GatewayBridgeBuilder {
       subprotocols: this._subprotocols,
       concurrency: this._concurrency,
       reserveMs: this._reserveMs,
+      connectTimeout: this._connectTimeout,
+      maxConnectionData: this._maxConnectionData,
     });
     for (const protocol of this._protocols) bridge.use(protocol);
+    for (const hook of this._connectHooks) bridge.onConnect(hook);
     return bridge;
   }
 }

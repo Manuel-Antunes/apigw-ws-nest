@@ -7,21 +7,38 @@ on:
 
 jobs:
   build:
+    name: Nest ${{ matrix.nest }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The peer range is ^11 || ^12: the lockfile pins 12, and the 11 leg
+        # installs that line over it — same code, same suites.
+        nest: [12, 11]
+
     steps:
       - uses: actions/checkout@v4
 
       # pnpm version comes from the "packageManager" field in package.json.
       - uses: pnpm/action-setup@v4
 
+      # 22: vitest 5 needs >= 22.12. The library itself supports Node >= 20.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
 
-      - name: Typecheck (lib + example)
+      - name: Install the Nest 11 line
+        if: matrix.nest == 11
+        run: >-
+          pnpm add -D
+          @nestjs/common@^11 @nestjs/core@^11 @nestjs/websockets@^11
+          @nestjs/platform-express@^11 @nestjs/platform-fastify@^11 @nestjs/platform-ws@^11
+          @nestjs/graphql@^13 @nestjs/apollo@^13
+
+      - name: Typecheck (library, example, tests)
         run: pnpm run typecheck
 
       - name: Build (ESM + CJS + types)
@@ -33,3 +50,16 @@ jobs:
 
       - name: Smoke-test ESM bundle
         run: node --input-type=module -e "import('./dist/index.mjs').then(m=>{if(!m.createNestApp) throw new Error('esm export missing'); console.log('esm ok')})"
+
+      # Unit, integration (Express + Fastify) and end-to-end (each suite starts
+      # its own emulator), with coverage thresholds enforced.
+      - name: Test
+        run: pnpm run test:coverage
+
+      - name: Coverage report
+        if: matrix.nest == 12 && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: ignore

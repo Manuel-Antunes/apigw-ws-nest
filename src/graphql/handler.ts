@@ -15,6 +15,7 @@
  *    ping                            -> pong                          (no state)
  *    subscribe, query/mutation       -> execute now, next + complete  (no state)
  *    subscribe, subscription         -> learn the topics, persist the row
+ *                                       (with a snapshot of client.data)
  *    <someone publishes to a topic>  -> replay every stored row, push `next`
  *    complete / $disconnect / 410    -> delete the rows
  *
@@ -87,8 +88,13 @@ export interface GraphQLWsOptions {
   pubsub?: ApiGwPubSub;
   /** Extra values merged into the GraphQL `context` for every operation on this
    *  socket. Called for the initial `subscribe` AND for every replay, so keep it
-   *  derivable from the connectionId alone (durable state, not in-process). */
-  context?: (connectionId: string) => Record<string, unknown> | Promise<Record<string, unknown>>;
+   *  derivable from its arguments alone (durable state, not in-process):
+   *  the connectionId, and the connection's `client.data` as accepted at
+   *  $connect. */
+  context?: (
+    connectionId: string,
+    connection: { data: Record<string, unknown> },
+  ) => Record<string, unknown> | Promise<Record<string, unknown>>;
 }
 
 const isAsyncIterable = (value: unknown): value is AsyncIterable<unknown> =>
@@ -237,7 +243,7 @@ export class GraphQLWsHandler implements ProtocolHandler {
       document,
       variableValues: payload.variables ?? undefined,
       operationName: payload.operationName ?? undefined,
-      contextValue: await this.context(client.connectionId),
+      contextValue: await this.context(client.connectionId, client.data),
     };
 
     // Queries and mutations are single-result operations: graphql-ws runs them
@@ -296,6 +302,11 @@ export class GraphQLWsHandler implements ProtocolHandler {
       query: payload.query,
       variables: payload.variables ?? null,
       operationName: payload.operationName ?? null,
+      // A replay runs from the flush path, with no client and no frame. Reading
+      // the connection back there would cost a store read per subscriber per
+      // publish; client.data cannot change after $connect, so a snapshot taken
+      // now is exact.
+      ...(Object.keys(client.data).length ? { connectionData: client.data } : {}),
     });
   }
 
@@ -337,7 +348,7 @@ export class GraphQLWsHandler implements ProtocolHandler {
       document,
       variableValues: record.variables ?? undefined,
       operationName: record.operationName ?? undefined,
-      contextValue: await this.context(record.connectionId),
+      contextValue: await this.context(record.connectionId, record.connectionData ?? {}),
     };
 
     // Replay mode: the field's subscribe() sees a stream carrying exactly this
@@ -403,22 +414,30 @@ export class GraphQLWsHandler implements ProtocolHandler {
       await this.sendRaw(connectionId, message);
     } catch (err) {
       if (!isConnectionGone(err)) throw err;
-      await this.host.cleanup(connectionId); // 410 — drops rooms + our rows
+      await this.host.cleanup(connectionId, 'gone'); // 410 — drops rooms + our rows
     }
   }
 
   /** Built for the initial `subscribe` AND for every replay, so it must be
-   *  derivable from the connectionId alone — there is no request to read.
+   *  derivable from the connection's durable state alone — there is no request
+   *  to read.
+   *
+   *  `connection` carries the identity established at $connect, so a resolver
+   *  reads it with the ordinary `@Context('connection')`.
    *
    *  `pubsub` is published here so resolvers can use the ordinary
    *  `@Context('pubsub')` and stay ignorant of this handler. It goes on last: a
    *  user-supplied key of the same name must not replace the one instance that
    *  actually works on this runtime. */
-  private async context(connectionId: string): Promise<Record<string, unknown>> {
-    const extra = (await this.extraContext?.(connectionId)) ?? {};
+  private async context(
+    connectionId: string,
+    data: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const extra = (await this.extraContext?.(connectionId, { data })) ?? {};
     return {
       connectionId,
       transport: 'apigw-ws',
+      connection: { id: connectionId, data },
       ...extra,
       [PUBSUB_CONTEXT_KEY]: this.pubsub,
     };

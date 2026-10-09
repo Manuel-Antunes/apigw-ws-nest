@@ -1,0 +1,12 @@
+/* Typecheck for the test suites. Tests are ESM (vitest), so unlike the library's
+ * CommonJS tsconfig they may use import.meta and top-level await. */
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["**/*.ts", "../src/**/*.ts", "../vitest.config.mts"]
+}

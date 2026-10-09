@@ -14,12 +14,18 @@
  * ========================================================================== */
 
 export interface SessionMeta {
+  /** Never written by the library — put identity in `data` instead. */
   userId?: string;
   connectedAt: number;
   /** The WebSocket subprotocol negotiated at $connect, if any (e.g.
    *  `graphql-transport-ws`). Absent means the socket speaks this library's own
    *  `{ event, data }` frames. */
   subprotocol?: string;
+  /** The connection's `client.data`, as accepted at $connect: JSON-normalised
+   *  and at most `maxConnectionData` bytes. Absent when nothing was set. */
+  data?: Record<string, unknown>;
+  /** requestContext.identity.sourceIp at $connect. */
+  sourceIp?: string;
 }
 
 /** Opaque "resume from here" token for a paged read. Storage-specific (a
@@ -44,6 +50,13 @@ export interface ConnectionStore {
    *  into a single invocation's memory. Optional: a store that omits it falls
    *  back to membersOf(). */
   pageMembersOf?(room: string, cursor?: PageCursor): Promise<Page<string>>;
+  /** Read a connection back — what rehydrates `client.data` on an instance that
+   *  did not see the $connect.
+   *
+   *  MUST be strongly consistent with add(): a frame can reach another instance
+   *  right after $connect answered. MUST return null for an unknown or expired
+   *  connection — an expired row must not authenticate anybody. */
+  get(connectionId: string): Promise<SessionMeta | null>;
 }
 
 /** Outbound port. aws -> @connections Management API; local -> in-memory.
@@ -61,6 +74,9 @@ export interface RealtimePublisher {
    *  takes — that records the broadcast so delivery is retried. A primitive for
    *  callers that have already decided they want neither. */
   toRoom?(room: string, event: string, data: unknown): Promise<void>;
+  /** Close a connection server-side (aws: DeleteConnection; local: close the
+   *  emulator's socket). Resolves, rather than throws, when it is already gone. */
+  disconnect?(connectionId: string): Promise<void>;
 }
 
 /* ---- broadcasts ---------------------------------------------------------- */
@@ -158,3 +174,21 @@ export class ConnectionGoneError extends Error {
 /** True for a ConnectionGoneError from ANY copy of this module. */
 export const isConnectionGone = (err: unknown): boolean =>
   !!err && (err as any).name === 'ConnectionGoneError';
+
+/** Thrown from a connect hook to refuse a $connect with a chosen status — the
+ *  framework-agnostic counterpart of throwing a Nest HttpException. Identified
+ *  by `name`, like ConnectionGoneError, so a duplicated bundle copy still
+ *  matches. */
+export class ConnectionRejectedError extends Error {
+  readonly name = 'ConnectionRejectedError';
+  constructor(
+    readonly statusCode = 401,
+    message = 'connection rejected',
+  ) {
+    super(message);
+  }
+}
+
+/** True for a ConnectionRejectedError from ANY copy of this module. */
+export const isConnectionRejected = (err: unknown): boolean =>
+  !!err && (err as any).name === 'ConnectionRejectedError';

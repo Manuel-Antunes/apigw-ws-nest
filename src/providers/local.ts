@@ -10,16 +10,25 @@
 import { ConnectionStore, RealtimePublisher, SessionMeta } from '../ports';
 
 /** Maps connectionId -> live browser socket. The local emulator populates this;
- *  LocalPublisher delivers pushes through it. Unused in aws mode (the Management
- *  API reaches the real sockets). */
-export const LocalSocketRegistry = new Map<string, { send: (data: string) => void }>();
+ *  LocalPublisher delivers pushes through it (and closes it on disconnect()).
+ *  Unused in aws mode (the Management API reaches the real sockets). */
+export const LocalSocketRegistry = new Map<
+  string,
+  { send: (data: string) => void; close?: () => void }
+>();
 
 export class InMemoryConnectionStore implements ConnectionStore {
   private readonly conns = new Map<string, SessionMeta>();
   private readonly rooms = new Map<string, Set<string>>();
 
   async add(id: string, meta: SessionMeta) {
-    this.conns.set(id, meta);
+    this.conns.set(id, structuredClone(meta));
+  }
+  /** A copy, never the stored object: mutating what this returns must not leak
+   *  back into the "table" — the same isolation DynamoDB gives for free. */
+  async get(id: string) {
+    const meta = this.conns.get(id);
+    return meta ? structuredClone(meta) : null;
   }
   async remove(id: string) {
     this.conns.delete(id);
@@ -65,5 +74,10 @@ export class LocalPublisher implements RealtimePublisher {
   async toRoom(room: string, event: string, data: unknown) {
     const ids = await this.store.membersOf(room);
     await Promise.all(ids.map((id) => this.toConnection(id, event, data)));
+  }
+  /** Close the emulator's socket. Its 'close' handler then dispatches
+   *  $disconnect, as API Gateway does after DeleteConnection. */
+  async disconnect(id: string) {
+    LocalSocketRegistry.get(id)?.close?.();
   }
 }

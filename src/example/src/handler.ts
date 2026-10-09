@@ -32,9 +32,10 @@ const bridge = GatewayBridge.builder().provider('aws').build();
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { logger: ['error', 'warn'] });
-  // BEFORE init(): keeps the adapter's raw dispatch route ahead of Nest's 404
-  // catch-all, registers the {event,data} protocol on the bridge, and binds the
-  // @SubscribeMessage handlers to THIS bridge.
+  // BEFORE init(): registers the {event,data} protocol on the bridge and binds
+  // the @SubscribeMessage handlers to THIS bridge. The defaults are the Lambda
+  // ones: $connect runs each gateway's handleConnection, awaited (throwing
+  // refuses the socket), and there is no HTTP dispatch route to forge into.
   app.useWebSocketAdapter(new ApiGatewayWsAdapter(app, bridge));
   await app.init();
   // AFTER init(): GraphQLModule has built the schema by now. Same `pubsub` the
