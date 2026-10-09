@@ -1,6 +1,10 @@
 # Plan: authenticate (and reject) a connection at `$connect`
 
-> **Status: plan only.** Nothing described here is implemented yet. Written against `main` at
+> **Status: implemented as 3.0.0** — the 2.1.0 opt-ins and the 3.0.0 items shipped together, in
+> one major (tasks 1–19 and 21–24 of [§14](#14-task-checklist); the Fastify run of task 13 is in the
+> integration suite; the migration guide is the README's "Upgrading from 2.x" plus `CHANGELOG.md`).
+> The `.mjs` suites of §12 became a Vitest suite (`test/`). Still open: the release itself (task 20)
+> and the AWS checks of §15. The rest of this document is the plan as written. Written against `main` at
 > `d81bb64` (`apigw-ws-nest@2.0.0`). Every `file:line` below refers to that commit unless it names a
 > NestJS package, in which case it refers to the published tarball of that exact version
 > (`@nestjs/websockets@11.2.7`, `@nestjs/websockets@12.1.2`, `@nestjs/platform-ws@12.1.2`,

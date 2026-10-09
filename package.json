@@ -1,6 +1,6 @@
 {
   "name": "apigw-ws-nest",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "NestJS custom WebSocketAdapter over AWS API Gateway WebSocket + DynamoDB, with a Lambda handler and a local emulator",
   "license": "MIT",
   "author": "Manuel Antunes",
@@ -39,7 +39,7 @@
     "./dist/graphql.mjs"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "packageManager": "pnpm@10.30.3",
   "publishConfig": {
@@ -61,7 +61,7 @@
     "build:js": "node scripts/build.mjs",
     "build:types": "tsc -p tsconfig.build.json",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p test/tsconfig.json",
     "prepublishOnly": "node scripts/build.mjs && tsc -p tsconfig.build.json",
     "dev": "ts-node src/example/src/local-server.ts",
     "start:http": "ts-node src/example/src/bootstrap.ts",
@@ -71,31 +71,29 @@
     "remove": "sst remove --stage dev",
     "build:lambda": "tsc -p tsconfig.lambda.json",
     "watch:lambda": "tsc -w -p tsconfig.lambda.json",
-    "test:gql": "node src/example/test/graphql-subscriptions.e2e.mjs",
-    "test:gql:aws": "LAG=8000 SKIP_RELOAD=1 node src/example/test/graphql-subscriptions.e2e.mjs",
-    "test:outbox": "pnpm build:js && node src/example/test/outbox.e2e.mjs"
-  },
-  "dependencies": {
-    "@nestjs/common": "^11.0.0",
-    "@nestjs/core": "^11.0.0",
-    "@nestjs/platform-express": "^11.0.0",
-    "@nestjs/websockets": "^11.0.0",
-    "reflect-metadata": "^0.2.0",
-    "rxjs": "^7.8.0"
-  },
-  "optionalDependencies": {
-    "@aws-sdk/client-apigatewaymanagementapi": "^3.600.0",
-    "@aws-sdk/client-dynamodb": "^3.600.0",
-    "@aws-sdk/lib-dynamodb": "^3.600.0",
-    "@aws-sdk/util-dynamodb": "^3.600.0"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:unit": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "test:e2e": "vitest run --project e2e",
+    "test:coverage": "vitest run --coverage"
   },
   "peerDependencies": {
-    "@nestjs/graphql": "^12.0.0 || ^13.0.0",
+    "@nestjs/common": "^11.0.0 || ^12.0.0",
+    "@nestjs/core": "^11.0.0 || ^12.0.0",
+    "@nestjs/websockets": "^11.0.0 || ^12.0.0",
+    "@nestjs/platform-express": "^11.0.0 || ^12.0.0",
+    "reflect-metadata": "^0.1.12 || ^0.2.0",
+    "rxjs": "^7.1.0",
+    "@nestjs/graphql": "^12.0.0 || ^13.0.0 || ^14.0.0",
     "graphql": "^16.0.0",
-    "graphql-ws": "^5.14.0",
+    "graphql-ws": "^5.14.0 || ^6.0.0",
     "graphql-subscriptions": "^2.0.0 || ^3.0.0"
   },
   "peerDependenciesMeta": {
+    "@nestjs/platform-express": {
+      "optional": true
+    },
     "@nestjs/graphql": {
       "optional": true
     },
@@ -109,27 +107,46 @@
       "optional": true
     }
   },
+  "optionalDependencies": {
+    "@aws-sdk/client-apigatewaymanagementapi": "^3.600.0",
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0",
+    "@aws-sdk/util-dynamodb": "^3.600.0"
+  },
   "devDependencies": {
     "@apollo/server": "^5.5.1",
     "@as-integrations/express5": "^1.1.2",
-    "@nestjs/apollo": "^13.4.2",
-    "@nestjs/graphql": "^13.4.2",
-    "@nestjs/platform-ws": "^11.1.27",
+    "@nestjs/apollo": "^14.0.3",
+    "@nestjs/common": "^12.1.2",
+    "@nestjs/core": "^12.1.2",
+    "@nestjs/graphql": "^14.0.3",
+    "@nestjs/platform-express": "^12.1.2",
+    "@nestjs/platform-fastify": "^12.1.2",
+    "@nestjs/platform-ws": "^12.1.2",
+    "@nestjs/websockets": "^12.1.2",
+    "@swc/core": "^1.16.13",
     "@types/aws-lambda": "^8.10.162",
-    "@types/node": "^20.0.0",
+    "@types/node": "^22.20.5",
     "@types/ws": "^8.5.0",
+    "@vitest/coverage-v8": "^5.0.3",
     "dotenv": "^17.4.2",
     "esbuild": "^0.28.1",
     "graphql": "^16.14.2",
     "graphql-subscriptions": "^3.0.0",
-    "graphql-ws": "^5.16.0",
+    "graphql-ws": "^6.3.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
     "sst": "^3.19.3",
     "ts-node": "^10.9.0",
-    "typescript": "^5.4.0",
+    "typescript": "^5.9.3",
+    "unplugin-swc": "^2.0.0",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.3",
     "ws": "^8.17.0"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
+      "@swc/core",
       "esbuild"
     ]
   }

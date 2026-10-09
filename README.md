@@ -23,8 +23,9 @@ emulator, so you can develop and test the whole flow on your machine.
 - [Protocols](#protocols)
 - [GraphQL subscriptions](#graphql-subscriptions)
 - [Gateway API](#gateway-api)
+- [Authentication at `$connect`](#authentication-at-connect)
 - [Architecture](#architecture)
-- [The cross‑instance rule (read this)](#the-cross-instance-rule-read-this)
+- [The cross-instance rule (read this)](#the-cross-instance-rule-read-this)
 - [Runtime modes](#runtime-modes)
 - [Local development](#local-development)
 - [Deploying to AWS with SST](#deploying-to-aws-with-sst)
@@ -32,8 +33,10 @@ emulator, so you can develop and test the whole flow on your machine.
 - [Configuration (environment)](#configuration-environment)
 - [Public API reference](#public-api-reference)
 - [Example app](#example-app)
+- [Testing](#testing)
 - [Build & publish](#build--publish)
 - [Production notes & caveats](#production-notes--caveats)
+- [Upgrading from 2.x](#upgrading-from-2x)
 - [License](#license)
 
 ---
@@ -64,6 +67,10 @@ Socket.IO/ws.
   `graphql-transport-ws`, durable across instances. One `bridge.use()`, no module.
 - **[Durable fan-out](#durable-fan-out-outbox--dynamodb-streams)** — a broadcast is recorded, then
   delivered by a DynamoDB Stream consumer: retried until it lands, ordered per topic, deduplicated.
+- **[Authentication at `$connect`](#authentication-at-connect)** — `handleConnection` runs at
+  `$connect`, awaited, with the handshake; throwing refuses the socket. Identity lives in
+  `client.data`, persisted with the connection and rehydrated on any instance, so a plain Nest guard
+  works everywhere.
 - **Multiple gateways** on one connection (routes are merged, not overwritten).
 - Three runtimes: **Lambda**, **HTTP (ECS/Fargate)**, **local emulator** — one codebase.
 - Four pluggable ports — `ConnectionStore`, `RealtimePublisher`, `MessageBus`, `DeliveryLedger` —
@@ -79,16 +86,29 @@ npm install apigw-ws-nest
 # or: pnpm add apigw-ws-nest
 ```
 
-It depends on the NestJS WebSocket stack (`@nestjs/common`, `@nestjs/core`,
-`@nestjs/platform-express`, `@nestjs/websockets`), `rxjs`, and `reflect-metadata`. For **AWS mode**
-the AWS SDK v3 packages are `optionalDependencies` (loaded lazily, so local mode never needs them):
+> **Coming from 2.x?** 3.0 changes what `handleConnection` means and turns the HTTP dispatch route
+> off by default — read [Upgrading from 2.x](#upgrading-from-2x).
+
+NestJS is a **peer dependency** — the library runs on the copy your app already has, **Nest 11 or
+12** — so install the WebSocket stack next to it:
+
+```bash
+npm install @nestjs/common @nestjs/core @nestjs/websockets rxjs reflect-metadata
+npm install @nestjs/platform-express   # or @nestjs/platform-fastify — see createNestApp's httpAdapter
+```
+
+`@nestjs/platform-express` is an *optional* peer: `createNestApp` falls back to Nest's default
+(Express) only when you don't pass an `httpAdapter`, so a Fastify app never needs it. For **AWS
+mode** the AWS SDK v3 packages are `optionalDependencies` (loaded lazily, so local mode never needs
+them):
 
 ```bash
 npm install @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb @aws-sdk/client-apigatewaymanagementapi
 ```
 
-> Requires Node ≥ 18 and `reflect-metadata` imported once at your app's entry (this package imports
-> it for you when you import from it).
+> Requires Node ≥ 20 and `reflect-metadata` imported once at your app's entry (this package imports
+> it for you when you import from it). Nest 12 is ESM-only: an app that loads this package's
+> **CommonJS** build alongside it relies on `require(esm)`, so use Node ≥ 20.19 (or ≥ 22.12).
 
 ---
 
@@ -160,8 +180,7 @@ const bridge = GatewayBridge.builder().provider('aws').build();
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
-  // BEFORE init(): this keeps the adapter's raw dispatch route ahead of Nest's
-  // 404 catch-all, registers the { event, data } protocol on the bridge, and
+  // BEFORE init(): registers the { event, data } protocol on the bridge and
   // binds the @SubscribeMessage handlers to it.
   app.useWebSocketAdapter(new ApiGatewayWsAdapter(app, bridge));
   await app.init();
@@ -176,13 +195,16 @@ export const handler = async (event: any, context?: any) => {
 };
 ```
 
-Those two middle lines are all `createNestApp(AppModule, bridge)` does, if you'd rather have the
-shorthand:
+Those two middle lines are all `createNestApp` does, if you'd rather have the shorthand:
 
 ```ts
 const app = await createNestApp(AppModule, bridge);
 await app.init();
 ```
+
+The adapter's defaults are the Lambda ones: a gateway's `handleConnection` runs at `$connect`,
+awaited, and can refuse the socket ([Authentication at `$connect`](#authentication-at-connect)), and
+no HTTP route is registered — `bridge.serve()` is the only entry point.
 
 Point `$connect`, `$disconnect`, `$default` **and the outbox table's stream** at this one function
 (see [Deploying](#deploying-to-aws-with-sst)). That's it.
@@ -222,7 +244,8 @@ const bridge = GatewayBridge.builder()
   .publisher((store) => new MyPublisher(store))
   .concurrency(50)                    // sends in flight per fan-out page
   .use(someProtocol)                  // a wire protocol (see below)
-  .build();
+  .onConnect(authenticate)            // refuse or identify at $connect (see Authentication)
+  .build();                           // or .build(MyBridge) for a subclass
 ```
 
 The result owns everything it needs — `bridge.store`, `bridge.publisher`, `bridge.bus`,
@@ -377,10 +400,11 @@ export interface ProtocolHandler {
   readonly fanout?: Record<string, FanoutResolver>;  // outbox kinds it delivers
   attach?(bridge: GatewayBridge): void;
   handleFrame(frame, client, event): Promise<boolean>;   // true = it was mine
-  onDisconnect?(connectionId: string): Promise<void>;
+  onConnect?(client: GatewayClient, event): Promise<void>;   // $connect: throw to refuse
+  onDisconnect?(connectionId: string, client?: GatewayClient, reason?: string): Promise<void>;
 }
 
-bridge.use(handler);   // frames, disconnect cleanup, fan-out kinds, subprotocol — all four
+bridge.use(handler);   // frames, connect + disconnect hooks, fan-out kinds, subprotocol
 ```
 
 Two consequences worth knowing:
@@ -391,6 +415,10 @@ Two consequences worth knowing:
 - **`fallback: true` means "no frame signature".** The NestJS protocol can't recognise its own frames
   (any JSON object with an `event` could be one), so it must only see what nobody else claimed.
   `ApiGatewayWsAdapter` registers it for you.
+- **`onConnect` is a connect hook** — it can refuse the socket and write `client.data`; see
+  [Authentication at `$connect`](#authentication-at-connect). `onDisconnect` runs before the
+  connection's rows are dropped, and receives the client (with its `data`) when there is one, plus
+  why: the `$disconnect` reason, `'gone'` after a `410`, or `'server disconnect'`.
 
 ---
 
@@ -565,7 +593,7 @@ A subscription that works locally is silently dropped in production.
 
 | | |
 |---|---|
-| `subscribe` | run graphql's `createSourceEventStream` only to **learn the topics**, then store `{connectionId, subscriptionId, topics, query, variables}` and throw the stream away |
+| `subscribe` | run graphql's `createSourceEventStream` only to **learn the topics**, then store `{connectionId, subscriptionId, topics, query, variables, connectionData}` and throw the stream away |
 | `publish` | read the rows for that topic and **replay** each one: re-run the source stage with a one-shot stream carrying the payload, then `execute()` with it as `rootValue` |
 | `complete` / `$disconnect` / `410` | delete the rows |
 
@@ -616,6 +644,32 @@ deliver into each other's sockets.
 `graphql-ws`'s *server* (`makeServer`) is deliberately **not** used: it keeps the connection context
 and every subscription's iterator in memory for the socket's lifetime, so over API Gateway it would
 ack the handshake and then lose every subscription when the invocation returned.
+
+### Identity: `@Context('connection')`
+
+Every operation over the socket gets the connection's identity in its context, as
+`connection: { id, data }` — the `client.data` your `handleConnection` (or any connect hook) wrote at
+`$connect`:
+
+```ts
+@Query(() => String, { nullable: true })
+whoami(@Context('connection') connection?: { data: { user?: { name: string } } }) {
+  return connection?.data.user?.name ?? null;
+}
+```
+
+The `context` option's callback receives it too: `context: (connectionId, { data }) => ({ ... })`.
+
+Replays are the subtle part. A publish re-executes every stored subscription from the flush path,
+with no client and no frame, and reading the connection back there would cost a store read per
+subscriber per publish. So `client.data` is **snapshotted into the subscription's registry row** at
+subscribe time (`connectionData`). Since `data` can't change after `$connect`, the snapshot is exact
+— and `maxConnectionData` keeps each row's share of it bounded.
+
+**Authenticate GraphQL sockets at `$connect`, not at `connection_init`.** `connectionParams` arrive
+only after API Gateway has accepted — and billed — the socket, and `connection_init` is acknowledged
+unconditionally. Pass a short-lived ticket in the query string, or a `Sec-WebSocket-Protocol` entry
+next to `graphql-transport-ws`: the same `handleConnection` then covers both protocols.
 
 ### Storage
 
@@ -674,10 +728,20 @@ Everything below is the standard NestJS WebSocket surface; this library just imp
 ### `@ConnectedSocket() client: GatewayClient`
 
 - `client.join(room): Promise<void>` / `client.leave(room): Promise<void>` — room membership
-  (persisted in the store).
+  (persisted in the store). During `$connect`, recorded and applied once the connection is accepted.
 - `client.emit(event, data): Promise<void>` / `client.send(frame): Promise<void>` — send to **this**
-  connection.
+  connection. Awaited by the dispatch even when you don't `await` it, so a Lambda can't freeze
+  mid-send.
 - `client.connectionId: string`.
+- `client.handshake: Handshake` — Socket.IO's `socket.handshake`: `headers`, `query`,
+  `subprotocols`, `subprotocol`, `sourceIp`, `userAgent`, `connectedAt`, `authorizer`. Complete only
+  during `$connect` — see [what survives](#what-survives-connect-and-what-doesnt).
+- `client.data: TData` — Socket.IO's `socket.data`, where identity lives; `GatewayClient<TData>`
+  types it.
+- `client.rehydrated: boolean` — rebuilt from the store rather than created by `$connect` here.
+- `client.phase` — `'connecting'` | `'refused'` | `'open'`.
+- `client.disconnect(): Promise<void>` — during `$connect`, refuse with `403`; afterwards, close the
+  socket server-side.
 
 ### Handlers
 
@@ -697,7 +761,238 @@ Everything below is the standard NestJS WebSocket surface; this library just imp
 room), `$disconnect` (removes the connection from all rooms, tears down streams), and routes every
 other frame to your handlers. Gateways never touch the store for lifecycle.
 
+When `OnGatewayConnection` / `OnGatewayDisconnect` run depends on the adapter's `lifecycle`:
+
+| | `'connect'` (the default) | `'legacy'` (the 2.x behaviour) |
+|---|---|---|
+| `handleConnection(client)` | **once, at `$connect`, awaited**, with the full `client.handshake`; throwing refuses the socket | lazily, on the first frame each instance sees for a connection; no handshake; fire-and-forget |
+| `handleDisconnect(client, reason)` | on `$disconnect`, a `410 Gone` or `bridge.disconnect()`, with `client.data` still readable | never |
+
 ---
+
+## Authentication at `$connect`
+
+Identity is established **once**, when the socket opens, and read on every later frame — on any
+instance. A connection that fails is refused at the handshake with a status of your choosing, and
+nothing about it is ever written.
+
+### The Nest way: `handleConnection` + a guard
+
+`OnGatewayConnection.handleConnection(client)` runs **at `$connect`, awaited**, with the handshake on
+`client.handshake`; throwing refuses the socket. Whatever it writes to `client.data` (Socket.IO's convention) is persisted with the
+connection, and a plain `CanActivate` guard reads it back on any instance:
+
+```ts
+import { CanActivate, ExecutionContext, Inject, Injectable, UnauthorizedException, UseGuards } from '@nestjs/common';
+import { ConnectedSocket, OnGatewayConnection, OnGatewayDisconnect, SubscribeMessage, WebSocketGateway } from '@nestjs/websockets';
+import { GatewayClient } from 'apigw-ws-nest';
+
+type Identity = { user: { id: string; roles: string[] } };
+
+@WebSocketGateway()
+export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect {
+  constructor(@Inject(AuthService) private readonly auth: AuthService) {}
+
+  // Once per connection, at $connect, awaited. Throwing refuses the socket.
+  async handleConnection(client: GatewayClient<Identity>) {
+    const user = await this.auth.verify(client.handshake.query.ticket);
+    if (!user) throw new UnauthorizedException();           // -> 401 at $connect
+    client.data.user = { id: user.id, roles: user.roles };   // persisted with the connection
+    await client.join(`user:${user.id}`);                    // applied once accepted
+  }
+
+  handleDisconnect(client: GatewayClient<Identity>, reason?: string) {
+    // client.data is still readable here; the connection's row goes right after.
+  }
+
+  @UseGuards(WsUserGuard)
+  @SubscribeMessage('whoami')
+  whoami(@ConnectedSocket() client: GatewayClient<Identity>) {
+    return { event: 'whoami', data: client.data.user };
+  }
+}
+
+@Injectable()
+export class WsUserGuard implements CanActivate {
+  canActivate(context: ExecutionContext) {
+    // On ANY instance: the bridge rehydrated client.data from the store before Nest saw the frame.
+    return !!context.switchToWs().getClient<GatewayClient<Partial<Identity>>>().data.user;
+  }
+}
+
+// bootstrap — nothing to configure: lifecycle 'connect' is the default
+app.useWebSocketAdapter(new ApiGatewayWsAdapter(app, bridge));
+```
+
+A refusing guard is Nest's own: it throws `WsException('Forbidden resource')`, and the base filter
+answers with an `exception` frame. Calling `client.disconnect()` inside `handleConnection` — the
+Socket.IO idiom — refuses with `403`. With several gateways, each `handleConnection` runs in the order
+Nest binds them, and the first refusal stops the rest. It runs for **every** connection, whatever
+subprotocol it negotiated; a gateway that only cares about `{ event, data }` sockets checks
+`client.handshake.subprotocol`.
+
+**How Nest is persuaded.** Nest calls `handleConnection` fire-and-forget whenever the hub emits
+`'connection'` and drops the promise — a throw there is an unhandled rejection, not a refusal. So
+the adapter finds the gateways the way Nest's `SocketModule` does, keeps
+each original `handleConnection` for its own awaited call at `$connect`, and makes Nest's later call a
+no-op (calling the method yourself still runs it). `handleDisconnect` is called from the bridge's
+cleanup. Guards, pipes and interceptors do **not** run around `handleConnection` — Nest doesn't run
+them there either. A request-scoped gateway can't be reached this way, so one that implements either
+hook fails `app.init()` with an error naming it.
+
+`lifecycle: 'legacy'` restores the 2.x behaviour exactly — `handleConnection` runs lazily, on the
+first frame each instance sees, with no handshake; `handleDisconnect` never runs; frames are served
+without reading the store. It is there for [upgrading](#upgrading-from-2x) gateways that need time,
+not as a mode to build on.
+
+### Without Nest: `bridge.onConnect`
+
+The same mechanism, framework-agnostic. Hooks run in registration order, before any protocol's:
+
+```ts
+import { ConnectionRejectedError, GatewayBridge } from 'apigw-ws-nest';
+
+const bridge = GatewayBridge.builder()
+  .provider('aws')
+  .onConnect(async (client, event) => {          // repeatable
+    if (await rateLimited(client.handshake.sourceIp)) throw new ConnectionRejectedError(429);
+    client.data.tenant = await tenantOf(client.handshake.headers.host);
+  })
+  .connectTimeout(10_000)                        // the whole hook chain; on expiry -> 503 (default 10s)
+  .maxConnectionData(16 * 1024)                  // ceiling on client.data's JSON (default 16 KiB)
+  .build();                                      // or .build(MyBridge) for a subclass
+
+bridge.onConnect(hook);                          // the same, after build()
+```
+
+### In a protocol: `ProtocolHandler.onConnect`
+
+Authentication that belongs to a wire protocol rather than to the app — a bearer offered as a
+`Sec-WebSocket-Protocol` entry, a Phoenix `join_token` — goes in the protocol, next to its
+`handleFrame`. Protocols' hooks run after the builder's, and the Nest gateways' last:
+
+```ts
+class PhoenixProtocol implements ProtocolHandler {
+  readonly name = 'phoenix';
+  async onConnect(client: GatewayClient) {
+    const grant = await verify(client.handshake.query.join_token);
+    if (!grant) throw new ConnectionRejectedError(401);
+    client.data.grant = grant;               // claims, not the token
+  }
+  // handleFrame, onDisconnect, ...
+}
+```
+
+Every connect hook needs `ConnectionStore.get()`, to rehydrate `client.data` elsewhere. Registering
+one on a store without it throws at boot — better than a guard that passes on one container and
+refuses on the next.
+
+### How a refusal becomes a status
+
+Resolved by the error's **shape**, never by `instanceof`, so the core needs no Nest import:
+
+| The hook... | `$connect` answers |
+|---|---|
+| threw `ConnectionRejectedError(status)` | `status` |
+| called `client.disconnect()` | `403` |
+| threw a Nest `HttpException` — anything with `getStatus()` (`UnauthorizedException`, `ForbiddenException`, `new HttpException(msg, 429)`) | its status when 4xx, else `500` |
+| threw `new WsException({ status: 403, message })` — `getError()` with a 4xx `status`/`statusCode` | that status |
+| threw any other `WsException` | `401` |
+| outlived `connectTimeout` | `503` |
+| threw anything else (the database is down, a bug) | `500` — fail closed |
+
+A 4xx answers with the exception's message (at most 200 characters) and is not logged: refusals are
+expected traffic. A 5xx answers `connect failed` and is logged as `[connect: <hook or protocol>]`. A
+refused connection writes nothing — no `META` row, no rooms (joins made by the hooks are discarded)
+— and no `$disconnect` follows it.
+
+### What survives `$connect`, and what doesn't
+
+**One rule decides it: after `$connect`, a client looks the same on every instance** — the warm one
+that ran the hooks, and a cold one that rebuilt it from the store.
+
+| | during `$connect` | afterwards, on every instance |
+|---|---|---|
+| `client.handshake.headers` / `.query` / `.subprotocols` / `.userAgent` | the real ones | empty |
+| `client.handshake.connectedAt` / `.subprotocol` / `.sourceIp` | ✓ | ✓ (persisted) |
+| `client.handshake.authorizer` | ✓ | ✓ (API Gateway repeats it) |
+| `client.data` | writable | as persisted: JSON-normalised, **deep-frozen** |
+| `client.join()` / `client.leave()` | recorded, applied on accept | immediate |
+| `client.emit()` / `.send()` / `.sendRaw()` | **throw** | immediate |
+
+- **Headers are not persisted** — they are the bearer tokens. A guard reading
+  `client.handshake.headers.authorization` therefore fails immediately in development, instead of
+  passing on the warm instance and failing on scale-out.
+- **`client.data` is normalised with a JSON round trip** on the connecting instance too (a `Date` is
+  an ISO string everywhere), and capped by `maxConnectionData` — over the cap is a programming error
+  and answers `500`.
+- **Writing to `client.data` afterwards throws a `TypeError`.** A change made in a message handler
+  would exist on one container only.
+- **Don't put secrets in it.** It is stored in DynamoDB in clear: keep ids and claims, not tokens.
+- **No sends during `$connect`.** API Gateway does not deliver to a connection whose `$connect` hasn't
+  completed. `server.emit()` / `server.to(room).emit()` are fine — they are outbox writes, and the
+  connecting socket is in no room yet.
+
+Rehydration costs one strongly-consistent read per (instance, connection), not per frame: `data`
+can't change after `$connect`, so the cached copy can't go stale. `client.rehydrated` says which one
+you're holding.
+
+### Getting a token to `$connect` from a browser
+
+A browser can't set headers on a WebSocket. What works:
+
+- **A short-lived, single-use ticket in the query string** — fetch it over authenticated HTTP, then
+  `` new WebSocket(`${url}?ticket=${ticket}`) ``. Query strings reach API Gateway's access logs, hence
+  short-lived and single-use.
+- **An extra `Sec-WebSocket-Protocol` entry** — `new WebSocket(url, ['graphql-transport-ws',
+  'bearer.<token>'])`. Every offered entry is in `client.handshake.subprotocols`, and only a
+  registered protocol is ever echoed, so the token never comes back.
+- **A cookie**, when the API sits on a custom domain that is same-site with your app.
+
+### Identity lifetime, kicking, per-user rooms
+
+- **Identity does not expire with the token.** API Gateway keeps a socket open up to two hours. Put an
+  `expiresAt` in `client.data` and check it in your guard. `client.disconnect()` — or
+  `bridge.disconnect(connectionId)` from anywhere — closes the socket server-side (`DeleteConnection`
+  on AWS), after running the same cleanup as `$disconnect` with reason `'server disconnect'`.
+- **Per-user rooms are the index.** `` client.join(`user:${id}`) `` in `handleConnection` makes
+  `server.to('user:42').emit(...)` reach every socket of a user, and `store.membersOf('user:42')` list
+  them.
+- **Unknown connections are refused.** With a connect hook registered, a frame from a connection the
+  store doesn't know (never accepted, or expired) reaches no protocol: it is answered `403`, logged,
+  and the socket is closed. Connections opened before you turned the hooks on have no `data`, so your
+  guards refuse them and the clients reconnect through the new `$connect` — fail-closed by
+  construction.
+
+### `$connect`, end to end
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant APIGW as API Gateway
+  participant Br as GatewayBridge
+  participant Hk as onConnect hooks / handleConnection
+  participant St as ConnectionStore
+
+  Client->>APIGW: upgrade ?ticket=...
+  APIGW->>Br: $connect (headers, query, identity)
+  Br->>Br: build the handshake, negotiate the subprotocol (nothing written)
+  Br->>Hk: builder hooks, then protocols (Nest gateways last)
+  alt a hook throws, disconnects or times out
+    Hk-->>Br: refusal
+    Br-->>APIGW: { statusCode: 401 | 403 | 429 | 503 | 500 }
+    APIGW-->>Client: handshake refused
+  else every hook accepts
+    Hk-->>Br: client.data, recorded joins
+    Br->>St: add(META + data), join(@@global)?, recorded joins
+    Br-->>APIGW: { statusCode: 200, Sec-WebSocket-Protocol? }
+    APIGW-->>Client: 101 Switching Protocols
+  end
+  Note over Br,St: a later frame on another instance: store.get(id) -> client.data, frozen
+```
+
+---
+
 
 ## Architecture
 
@@ -737,7 +1032,7 @@ sequenceDiagram
   Client->>APIGW: { event:"room.message", data:{...} }
   APIGW->>H: $default event
   H->>Br: dispatch(event)
-  Br->>Br: ensureClient -> emit "connection" -> Nest binds handlers
+  Br->>Br: materialize (cached, or rebuilt from the store) -> emit "connection" -> Nest binds handlers
   Br->>GW: handleFrame(frame) -> @SubscribeMessage
   GW->>Ob: server.to("room").emit(...) = one PutItem
   Br->>Br: flushBroadcasts() (await the durable write)
@@ -759,13 +1054,15 @@ receiving it twice.
 **The pieces** (`src/`):
 
 - `gateway-bridge.ts` — `GatewayBridge` (the entry point `dispatch`), plus the synthetic
-  `GatewayServer` and `GatewayClient`. Defines `GLOBAL_ROOM` and auto‑join on connect.
+  `GatewayServer` and `GatewayClient`. Defines `GLOBAL_ROOM` and auto‑join on connect, and the
+  connect phase: hooks, accept, rehydration of `client.data`.
 - `ws-adapter.ts` — `ApiGatewayWsAdapter`: the NestJS `WebSocketAdapter`. Binds `@SubscribeMessage`
   handlers (merging across multiple gateways), turns `@Ack`/returns/`Observable`s into outbound
-  sends, and registers the raw HTTP dispatch route for ECS mode.
+  sends, takes `handleConnection`/`handleDisconnect` over (`lifecycle: 'connect'`), and registers
+  the raw HTTP dispatch route for ECS mode.
 - `ports.ts` — every swappable interface, in one place and importing nothing: `ConnectionStore`,
-  `RealtimePublisher`, `MessageBus`, `DeliveryLedger`, the broadcast/fan-out vocabulary, and
-  `ConnectionGoneError`.
+  `RealtimePublisher`, `MessageBus`, `DeliveryLedger`, the broadcast/fan-out vocabulary,
+  `ConnectionGoneError` and `ConnectionRejectedError`.
 - `outbox.ts` — the durable fan-out: buses (publish = one write), ledgers (idempotency) and
   `Flusher` (paging, batching, continuation, 410 reaping).
 - `providers/aws.ts` — `DynamoConnectionStore` + `ApiGatewayPublisher`.
@@ -780,7 +1077,7 @@ receiving it twice.
 
 ---
 
-## The cross‑instance rule (read this)
+## The cross-instance rule (read this)
 
 Every Lambda invocation is a **separate, frozen process**, and the same connection may be served by
 **different containers** over time. Therefore:
@@ -808,18 +1105,58 @@ One gateway codebase, three ways to run it:
 | Mode | Entry | How frames arrive |
 |---|---|---|
 | **Lambda** (recommended) | `GatewayBridge.builder().provider('aws').build()` + `bridge.serve(event, ctx)` | one function, four triggers: the three WS routes and the outbox stream |
-| **HTTP (ECS/Fargate)** | `createNestApp(...).listen(HTTP_PORT)` | API Gateway WebSocket→HTTP integration `POST`s events to `DISPATCH_PATH` (default `/@dispatch`) |
+| **HTTP (ECS/Fargate)** | `createNestApp(...).listen(HTTP_PORT)` | API Gateway WebSocket→HTTP integration `POST`s events to the route `dispatchPath` registers (conventionally `DISPATCH_PATH`, `/@dispatch`), authenticated by `dispatchSecret` |
 | **Local emulator** | `ts-node local-server.ts` | a real `ws` server emulates API Gateway and calls `dispatch` |
 
 HTTP mode example:
 
 ```ts
-import { createNestApp, GatewayBridge, HTTP_PORT } from 'apigw-ws-nest';
+import { createNestApp, DISPATCH_PATH, GatewayBridge, HTTP_PORT } from 'apigw-ws-nest';
 import { AppModule } from './app.module';
 
 const bridge = GatewayBridge.builder().provider('aws').build();
-const app = await createNestApp(AppModule, bridge);
-await app.listen(HTTP_PORT); // the adapter already registered POST /@dispatch
+const app = await createNestApp(AppModule, bridge, {
+  // The one runtime that needs the dispatch route — so it asks for it. The
+  // secret defaults to APIGW_DISPATCH_SECRET.
+  adapter: { dispatchPath: DISPATCH_PATH, dispatchSecret: process.env.APIGW_DISPATCH_SECRET },
+  // httpAdapter: new FastifyAdapter(),   // optional; Express by default
+});
+await app.listen(HTTP_PORT); // the adapter registered POST /@dispatch
+```
+
+**The dispatch route is an entry point like any other.** It hands any JSON body to
+`bridge.dispatch` as an API Gateway event — so once identity is keyed by `connectionId`, a forged
+frame naming a live connection would be served *as* that connection. Hence:
+
+- **No route unless `dispatchPath` asks for one.** Lambda never needs it, which matters most when the
+  same app is also served over HTTP from Lambda (a function URL, Lambda Web Adapter): an unrequested
+  route would be on the internet. `APIGW_DISPATCH_PATH` only changes the `DISPATCH_PATH` constant; it
+  registers nothing by itself.
+- **`dispatchSecret`** (default `APIGW_DISPATCH_SECRET`) makes the route require that value in
+  `x-apigw-dispatch-secret` (or your `dispatchSecretHeader`), compared in constant time; anything else
+  is answered `403` before the body is read. The API Gateway HTTP integration adds it with a request
+  parameter mapping: `integration.request.header.x-apigw-dispatch-secret` = `'<secret>'`.
+
+The adapter warns once at boot when the route is registered without a secret while connect hooks
+are active. The route forwards the bridge's response headers through the HTTP adapter, so the
+`$connect` `Sec-WebSocket-Protocol` echo leaves the process on Express and Fastify alike.
+
+**Forward the handshake.** For connect hooks to see anything in HTTP mode, the integration's request
+template must carry the headers and the query string. A starting point — not yet verified against a
+deployed stage:
+
+```vtl
+{
+  "requestContext": {
+    "routeKey": "$context.routeKey", "eventType": "$context.eventType",
+    "connectionId": "$context.connectionId", "domainName": "$context.domainName",
+    "stage": "$context.stage", "requestId": "$context.requestId",
+    "connectedAt": $context.connectedAt,
+    "identity": { "sourceIp": "$context.identity.sourceIp" }
+  },
+  "headers": {#foreach($h in $input.params().header.keySet())"$h": "$util.escapeJavaScript($input.params().header.get($h))"#if($foreach.hasNext),#end#end},
+  "queryStringParameters": {#foreach($q in $input.params().querystring.keySet())"$q": "$util.escapeJavaScript($input.params().querystring.get($q))"#if($foreach.hasNext),#end#end}
+}
 ```
 
 ---
@@ -838,11 +1175,15 @@ pnpm dev            # ts-node src/example/src/local-server.ts  (RT_PROVIDER=loca
 # websocket   : ws://localhost:6005
 ```
 
-The emulator negotiates `Sec-WebSocket-Protocol` the way API Gateway does, so the browser's
-`graphql-ws` client completes its handshake locally too.
+The emulator behaves like API Gateway at `$connect`: it dispatches the `CONNECT` event — with the
+handshake headers, the query string and the client's address — **before** completing the upgrade,
+so a refusing connect hook refuses the handshake itself (a `ws` client sees `unexpected-response`
+with that status, a browser a failed handshake). It echoes whatever subprotocol the bridge
+negotiated, so the browser's `graphql-ws` client completes its handshake locally too.
 
 ```bash
-pnpm test:gql       # drives the emulator with the real graphql-ws client
+pnpm test:e2e       # real graphql-ws and ws clients against emulators the suites start themselves
+curl http://localhost:6005/__connections/<id>   # dev-only: what the store holds for a connection
 ```
 
 **Simulating a redeploy / new instance.** The emulator exposes a dev‑only endpoint that throws away
@@ -855,8 +1196,9 @@ curl -X POST http://localhost:6005/__reload   # = a fresh instance; rooms + conn
 
 A typical test: open two browser tabs, join the same room in both, hit `/__reload`, then send a
 message — it still arrives, because room membership lives in the store, not the (now‑rebuilt)
-process. `pnpm test:gql` does exactly this for a GraphQL subscription; that single assertion is what
-an in‑process PubSub cannot pass.
+process. The e2e suite does exactly this for a GraphQL subscription — that single assertion is what
+an in‑process PubSub cannot pass — and for identity: after `/__reload` the same socket is still the
+same user, because `client.data` was rehydrated from the store.
 
 ---
 
@@ -931,7 +1273,7 @@ messages.subscribe('Flush', gateway.arn, {
 });
 ```
 
-Seven things that bite people:
+Eight things that bite people:
 
 1. **`link` is what grants IAM.** Setting only the `environment` table name gives you the name but
    no permissions → `AccessDeniedException` on the first DynamoDB call. Every table the handler uses
@@ -953,6 +1295,11 @@ Seven things that bite people:
 7. **An ARN-referenced function gets no automatic permissions.** SST attaches the stream-read policy
    only when it *creates* the subscriber. Point a trigger at an existing ARN and you own that grant —
    and the omission fails at runtime on the event source mapping, not at deploy.
+8. **Nest 12 is ESM-only, and the bundle is CommonJS.** esbuild leaves `import.meta` empty in a CJS
+   bundle, and `@nestjs/graphql` calls `createRequire(import.meta.url)` while loading — the cold
+   start dies with *"The argument 'filename' must be a file URL … Received undefined"*. The
+   `sst.config.ts` here defines `import.meta.url` from `__filename` (an esbuild `define` plus a
+   one-line `banner`) and uses the `nodejs22.x` runtime.
 
 Deploy:
 
@@ -961,11 +1308,9 @@ pnpm live           # build:lambda && sst dev --stage dev   (live Lambda)
 pnpm deploy         # build:lambda && sst deploy --stage dev
 pnpm remove         # sst remove --stage dev
 
-# drive the deployed API with the real graphql-ws client
-GQL_URL='wss://<api-id>.execute-api.<region>.amazonaws.com/$default' pnpm test:gql:aws
-
-# the outbox guarantees (retry without duplication, batching, continuation, ordering)
-pnpm test:outbox
+# the end-to-end suites, against the deployed API instead of an emulator
+# (steps that need the emulator's dev endpoints are skipped; E2E_LAG tunes the waits)
+E2E_WS_URL='wss://<api-id>.execute-api.<region>.amazonaws.com/$default' pnpm test:e2e
 ```
 
 The bridge sets the per‑request `@connections` management endpoint automatically from
@@ -981,7 +1326,7 @@ interest map:
 
 | `pk` | `sk` | meaning |
 |---|---|---|
-| `CONN#<id>` | `META` | connection metadata (+ `ttl`, a safety net if `$disconnect` never fires) |
+| `CONN#<id>` | `META` | `connectedAt`, `subprotocol?`, `sourceIp?`, `data?` (a map: `client.data`) (+ `ttl`, a safety net if `$disconnect` never fires) |
 | `ROOM#<room>` | `CONN#<id>` | forward membership — `membersOf(room)` queries `pk = ROOM#<room>` |
 | `CONN#<id>` | `ROOM#<room>` | reverse index — lets `remove(id)` clear *every* room on disconnect |
 | `GQLTOPIC#<topic>` | `CONN#<id>#SUB#<sub>` | a GraphQL subscription — the fan‑out lookup, carrying its query + variables |
@@ -991,6 +1336,13 @@ interest map:
 The global channel is just `ROOM#@@global`. The reverse rows matter: without them a disconnect (or a
 `410 Gone`) would leave a connection ghosted in rooms forever, and every later broadcast would waste
 a doomed send on it.
+
+`META` is read back with a strongly-consistent `GetItem` to rehydrate `client.data`, and a row whose
+`ttl` is in the past is treated as missing: DynamoDB deletes expired items lazily, often days later,
+and an expired row must not authenticate anybody. `META.ttl` (connect + 3 h) outlives API Gateway's
+2 h connection limit, so `data` lives exactly as long as the connection could, and goes with `META`
+on `$disconnect` or a `410`. Note that `data` is a DynamoDB **reserved word**: an expression on it
+needs `ExpressionAttributeNames: { '#data': 'data' }`.
 
 This table is deliberately **not** streamed — it is written on every connect, join and subscribe, so
 a stream on it would be almost entirely noise. Enable **TTL on the `ttl` attribute**.
@@ -1027,7 +1379,8 @@ simultaneously the fan-out unit, the DynamoDB partition, and the stream's orderi
 | `POSTS_TABLE` | `posts` | example posts repo |
 | `CHAT_TABLE` | `chat` | example chat repo |
 | `PORT` | `3000` (`HTTP_PORT`) / `6005` (emulator) | HTTP bootstrap / local emulator |
-| `APIGW_DISPATCH_PATH` | `/@dispatch` | ECS/HTTP dispatch route |
+| `APIGW_DISPATCH_PATH` | `/@dispatch` | the value of `DISPATCH_PATH`, the conventional `dispatchPath` (ECS/HTTP mode) — it registers nothing by itself |
+| `APIGW_DISPATCH_SECRET` | — | the value the dispatch route requires in `x-apigw-dispatch-secret` (the adapter's `dispatchSecret`) |
 | `MANAGEMENT_ENDPOINT` | set per‑request | `@connections` endpoint (auto‑derived in Lambda; carried on each outbox record for the flush function, which has no request to derive it from) |
 | `WS_URL` | — | injected into the static test client so it knows the `wss://` URL |
 
@@ -1048,9 +1401,32 @@ bridge.dispatch(event)              // ...the WebSocket half explicitly
 bridge.flush(streamEvent, context)  // ...the outbox stream half -> { batchItemFailures }
 bridge.flushRecord(record)          // deliver one record now
 bridge.publish(broadcast)           // record a broadcast (any kind)
-bridge.use(protocol)                // frames + disconnect + fan-out kinds + subprotocol
-bridge.cleanup(connectionId)        // forget a connection everywhere
-bridge.store / .publisher / .bus / .flusher / .provider / .server / .subprotocols
+bridge.use(protocol)                // frames + connect/disconnect hooks + fan-out kinds + subprotocol
+bridge.onConnect(hook)              // a framework-agnostic connect hook (throw to refuse)
+bridge.disconnect(connectionId)     // kick: cleanup (reason 'server disconnect'), then close the socket
+bridge.materialize(connectionId)    // the client for a connection: cached, or rehydrated from the store
+bridge.cleanup(connectionId, reason?) // forget a connection everywhere
+bridge.store / .publisher / .bus / .flusher / .provider / .server / .subprotocols / .hasConnectHooks
+```
+
+```ts
+GatewayBridge.builder()
+  .provider('aws')                  // or .store() / .publisher() / .bus() / .ledger()
+  .use(protocol)
+  .onConnect(hook)                  // repeatable, registration order
+  .connectTimeout(10_000)           // the whole $connect hook chain -> 503 past it
+  .maxConnectionData(16 * 1024)     // ceiling on client.data's JSON
+  .subprotocols('x').concurrency(25).reserveMs(15_000)
+  .build();                         // or .build(MyBridge), for a GatewayBridge subclass
+
+new ApiGatewayWsAdapter(app, bridge, {
+  lifecycle: 'connect',             // the default | 'legacy' (the 2.x behaviour)
+  dispatchPath: DISPATCH_PATH,      // register the HTTP dispatch route here; default: none
+  dispatchSecret: '…',              // default APIGW_DISPATCH_SECRET
+  dispatchSecretHeader: 'x-apigw-dispatch-secret',
+});
+
+createNestApp(AppModule, bridge, { adapter, nest, httpAdapter });   // httpAdapter: e.g. new FastifyAdapter()
 ```
 
 ```ts
@@ -1060,6 +1436,7 @@ import {
   GatewayBridgeBuilder,
   GatewayClient, GatewayServer,
   GLOBAL_ROOM,            // the room every {event,data} connection auto-joins on $connect
+  handshakeOf,            // (event) => Handshake — what a connect hook sees as client.handshake
 
   // app wiring
   createNestApp,          // shorthand for NestFactory.create + useWebSocketAdapter (not initialized)
@@ -1079,10 +1456,12 @@ import {
   // errors
   ConnectionGoneError,    // throw/catch to signal a dead connection (HTTP 410)
   isConnectionGone,       // name-based check (survives duplicated bundle copies)
+  ConnectionRejectedError,// throw from a connect hook to refuse with a status (default 401)
+  isConnectionRejected,   // name-based check, likewise
 
   // contract + config
   EVENT_TYPE, ROUTE,      // 'CONNECT'|'MESSAGE'|'DISCONNECT' ; '$connect'|'$disconnect'|'$default'
-  PROVIDER, HTTP_PORT, DISPATCH_PATH,
+  PROVIDER, HTTP_PORT, DISPATCH_PATH, DISPATCH_SECRET, DISPATCH_SECRET_HEADER,
 
   // advanced: make an out-of-band send awaitable within the current dispatch
   enqueueBroadcast, runInDispatchScope, DispatchScope,
@@ -1103,6 +1482,7 @@ import {
 // types
 import type {
   ProtocolHandler, BridgeConfig, Provider,
+  Handshake, ConnectHook, ClientPhase, GatewayClientOptions, GatewayLifecycle,
   ConnectionStore, RealtimePublisher, MessageBus, DeliveryLedger,   // the four swappable ports
   DeliveryTarget, FanoutPage, FanoutResolver,
   Broadcast, RoomBroadcast, TopicBroadcast, OutboxRecord,
@@ -1122,14 +1502,31 @@ export interface ConnectionStore {
   join(connectionId: string, room: string): Promise<void>;
   leave(connectionId: string, room: string): Promise<void>;
   membersOf(room: string): Promise<string[]>;
+  /** Optional: membersOf, paged — what the fan-out path uses when present. */
+  pageMembersOf?(room: string, cursor?: PageCursor): Promise<Page<string>>;
+  /** Read a connection back — what rehydrates client.data on another instance.
+   *  Strongly consistent with add(); null for an unknown or expired connection. */
+  get(connectionId: string): Promise<SessionMeta | null>;
 }
 
 export interface RealtimePublisher {
   toConnection(connectionId: string, event: string, data: unknown): Promise<void>;
-  toRoom(room: string, event: string, data: unknown): Promise<void>;
   /** Optional: send a payload verbatim, with no { event, data } envelope.
    *  Required by GraphQL over WebSocket, whose frames are { type, id, payload }. */
   toConnectionRaw?(connectionId: string, payload: unknown): Promise<void>;
+  /** Optional: immediate, best-effort room fan-out — not what server.to().emit() uses. */
+  toRoom?(room: string, event: string, data: unknown): Promise<void>;
+  /** Optional: close a connection server-side; resolves when it is already gone.
+   *  Required by client.disconnect() / bridge.disconnect(). */
+  disconnect?(connectionId: string): Promise<void>;
+}
+
+export interface SessionMeta {
+  connectedAt: number;
+  subprotocol?: string;
+  sourceIp?: string;
+  data?: Record<string, unknown>;   // client.data, as accepted at $connect
+  userId?: string;                  // never written by the library — use data
 }
 ```
 
@@ -1156,15 +1553,48 @@ GatewayBridge.builder()
 - **Chat** (`chat/`) — **multi‑conversation** chat. The conversation *directory* is global
   (`chat.conversation.created`), while each conversation's *messages* are scoped to its room
   (`conv#<id>`). Two gateways (`PostGateway` + `ChatGateway`) run on one connection.
+- **Identity at `$connect`** (`chat/chat.gateway.ts`, `chat/ws-user.guard.ts`) —
+  `ChatGateway.handleConnection` accepts `?token=demo:<name>` into `client.data.user` (and the room
+  `user:<name>`), treats no token as anonymous, and refuses anything else with `401`. `WsUserGuard`
+  lets only identified connections `chat.send`, whose `from` is the authenticated name rather than
+  whatever the client sent. `chat.whoami` and the GraphQL `whoami` query report it.
 - **GraphQL** (`posts/post.resolver.ts`) — the *same* `PostService`, exposed as a stock
   `@Resolver` with three subscription flavours (global topic, dynamic per‑feed topic, and a
   server‑side `filter`). It lives in `PostModule` next to `PostGateway`: one feature, two protocols,
   one socket. A post created over GraphQL shows up in the plain‑WebSocket client's `post.list`.
 - **Static client** (`public/index.html`, `public/chat.html`, `public/graphql.html`) — a socket
   monitor, a multi‑chat UI, and a GraphQL console driven by the real `graphql-ws` client.
-- **E2E** (`test/graphql-subscriptions.e2e.mjs`) — `pnpm test:gql`.
+- **Emulator** (`src/emulator.ts`) — `startEmulator({ port })`: what `pnpm dev` runs on 6005, and
+  what each end-to-end suite starts on a free port of its own.
 
 Run it with `pnpm dev` and open http://localhost:6005.
+
+---
+
+## Testing
+
+[Vitest](https://vitest.dev), in three projects with one coverage report:
+
+| Project | Where | What it runs against |
+|---|---|---|
+| `unit` | `test/unit` | one module at a time — the DynamoDB classes against an in-memory fake DocumentClient fed real `@aws-sdk/lib-dynamodb` commands, the `@connections` publisher against a stubbed SDK client |
+| `integration` | `test/integration` | real Nest apps over the library, on **Express and Fastify**: the dispatch route, the `lifecycle: 'connect'` takeover, guards, a code-first `GraphQLModule` |
+| `e2e` | `test/e2e` | real `ws` and `graphql-ws` clients against the example app in an emulator the suite starts on a free port — or a deployed API (`E2E_WS_URL`) |
+
+```bash
+pnpm test             # everything
+pnpm test:unit        # / test:integration / test:e2e — one project
+pnpm test:coverage    # everything, with thresholds (≥ 98% statements/lines/functions, ≥ 95% branches)
+pnpm test:watch
+```
+
+Tests run through SWC (`unplugin-swc`) rather than Vite's esbuild transform, because Nest — and
+`@nestjs/graphql`'s `@Args()` in particular — needs the `design:paramtypes` metadata only a compiler
+implementing `emitDecoratorMetadata` emits. Running them needs Node ≥ 22.12 (Vitest's own floor;
+the library supports ≥ 20).
+
+CI runs the whole suite twice: on the Nest 12 the lockfile pins, and on the Nest 11 line installed
+over it — the two majors the peer range promises.
 
 ---
 
@@ -1174,7 +1604,7 @@ The library builds to **dual ESM + CJS** with esbuild, and types with `tsc`:
 
 ```bash
 pnpm build        # node scripts/build.mjs (dist/index.mjs + dist/index.cjs)  &&  tsc -p tsconfig.build.json (dist/*.d.ts)
-pnpm typecheck    # tsc --noEmit (library + example)
+pnpm typecheck    # tsc --noEmit (library + example, then the test suites)
 ```
 
 `package.json` exposes the conditional exports:
@@ -1191,11 +1621,13 @@ pnpm typecheck    # tsc --noEmit (library + example)
 
 CI lives in `.github/workflows/`:
 
-- **ci.yml** — on push/PR: install, typecheck, build, and load‑test both bundles.
-- **publish.yml** — on a published GitHub Release: build and `pnpm publish` to npm with
+- **ci.yml** — on push/PR, once on Nest 12 and once on Nest 11: install, typecheck, build,
+  load‑test both bundles, then `pnpm test:coverage` (unit, integration, e2e) with its thresholds.
+- **publish.yml** — on a published GitHub Release: build, test, and `pnpm publish` to npm with
   **provenance**. Requires an `NPM_TOKEN` repository secret (an npm *Automation* token).
 
-To cut a release: bump `version`, tag `vX.Y.Z`, and publish a GitHub Release.
+To cut a release: make sure `version` and the top entry of [CHANGELOG.md](./CHANGELOG.md) agree,
+date that entry, tag `vX.Y.Z`, and publish a GitHub Release with its notes.
 
 ---
 
@@ -1219,8 +1651,101 @@ To cut a release: bump `version`, tag `vX.Y.Z`, and publish a GitHub Release.
 - **Streams are per‑connection, in‑process.** An `Observable` returned from a handler only lives in
   the current container; use it for per‑connection server‑push, not cross‑client fan‑out (use rooms/
   global for that). See [the cross‑instance rule](#the-cross-instance-rule-read-this).
-- **Framework duplication.** If you publish your own fork, consider moving `@nestjs/*`, `rxjs`, and
-  `reflect-metadata` to `peerDependencies` so consumers don't get a second framework instance.
+- **Connect-phase limits.** No sends to the connecting socket during `$connect`; the hook chain is
+  bounded by `connectTimeout` (10 s — API Gateway itself gives up on an integration at 29 s); and
+  `client.data` is written with every connection, so `maxConnectionData` (16 KiB) is a ceiling, not a
+  target — `META` costs a write unit per KB.
+- **One framework instance.** `@nestjs/*`, `rxjs` and `reflect-metadata` are `peerDependencies`
+  (`@nestjs/*` at `^11 || ^12`), so the library always runs on your app's copy. A package manager
+  with strict peers will refuse a Nest major outside that range — intentionally.
+
+## Upgrading from 2.x
+
+3.0 is the release in which `$connect` became a decision: a connection can be refused, and who it
+is survives to every later frame on every instance. Five changes can reach a 2.x app — most apps
+only meet the first two. The full list is in [CHANGELOG.md](./CHANGELOG.md).
+
+### 1. NestJS is a peer dependency
+
+`@nestjs/common`, `@nestjs/core`, `@nestjs/websockets`, `rxjs` and `reflect-metadata` are now
+`peerDependencies` (`@nestjs/*` at `^11 || ^12`), and `@nestjs/platform-express` is an optional
+peer. An app already depends on Nest, so usually there is nothing to install — but **remove any
+`overrides` / `resolutions` you added to keep a single copy of Nest**: there is no second copy any
+more. Nest 12 works out of the box, with `@nestjs/graphql` 14 and `graphql-ws` 6.
+
+- Node ≥ 20. Loading the CommonJS build next to Nest 12 (which is ESM-only) relies on
+  `require(esm)`: Node ≥ 20.19 or ≥ 22.12.
+- A Fastify app no longer needs `@nestjs/platform-express`:
+  `createNestApp(AppModule, bridge, { httpAdapter: new FastifyAdapter() })`.
+- Bundling a Nest 12 Lambda as CommonJS needs an `import.meta.url` shim — see
+  [Deploying](#deploying-to-aws-with-sst), item 8.
+
+### 2. `handleConnection` runs at `$connect` — and can refuse
+
+The adapter's `lifecycle` now defaults to `'connect'`. For a gateway that implements
+`OnGatewayConnection`, that changes:
+
+| | 2.x | 3.0 |
+|---|---|---|
+| when it runs | on the first frame each instance saw, lazily | **once, at `$connect`**, on the instance that handles it |
+| awaited | no — a throw was an unhandled rejection | **yes** — a throw refuses the socket ([status table](#how-a-refusal-becomes-a-status)); an unexpected error is a `500` |
+| `client.handshake` | absent | headers, query, subprotocols, source IP… |
+| sending from it | best effort | **throws**: API Gateway has no socket to deliver to yet |
+| `handleDisconnect` | never called | called on `$disconnect`, `410 Gone` and `bridge.disconnect()` |
+
+Go through each `handleConnection`:
+
+- **Does it send?** (`client.emit('welcome', …)`) — move the send to a frame the client sends once
+  it is open (a `hello` message), or broadcast it with `server.to(room).emit()`.
+- **Does it set up per-instance state** (subscribe the client to an in-process stream)? It now runs
+  on one instance only. Such state was never cross-instance safe (see
+  [the cross-instance rule](#the-cross-instance-rule-read-this)); move it to a room or a message
+  handler.
+- **Can it throw for a reason that should not refuse the socket?** Catch it: a throw is now a
+  refusal, not a log line.
+- **`handleDisconnect` now runs** — check it is safe to call.
+- **Writing `client.data` after `$connect` throws** (it is frozen); write identity in
+  `handleConnection`.
+
+Need more time? `new ApiGatewayWsAdapter(app, bridge, { lifecycle: 'legacy' })` restores the 2.x
+behaviour exactly, per adapter, while you migrate.
+
+### 3. The HTTP dispatch route is off unless you ask for it
+
+**Lambda** (`bridge.serve()`): nothing to do — and any `dispatchPath: false` you added can go.
+**HTTP/ECS mode**: ask for the route, and protect it:
+
+```ts
+createNestApp(AppModule, bridge, { adapter: { dispatchPath: DISPATCH_PATH } });
+// + APIGW_DISPATCH_SECRET in the environment, sent by the integration as x-apigw-dispatch-secret
+```
+
+`APIGW_DISPATCH_PATH` on its own registers nothing any more; it only changes `DISPATCH_PATH`.
+
+### 4. A custom `ConnectionStore` needs `get()`
+
+It is what rehydrates `client.data` on an instance that did not see the `$connect`, so it is part of
+the interface now — a store without it no longer compiles (and one that reaches the bridge through
+plain JavaScript fails at boot, not on a cold instance's first frame). Two rules: **strongly
+consistent** with `add()` (a frame can reach another instance right after `$connect` answered), and
+**`null` for an unknown or expired connection**:
+
+```ts
+async get(connectionId: string): Promise<SessionMeta | null> {
+  const row = await this.db.findConnection(connectionId);      // a primary/consistent read
+  if (!row || row.expiresAt <= Date.now()) return null;          // expired must not authenticate
+  return row.meta;                                               // what add() was given
+}
+```
+
+`add()` now receives `data` and `sourceIp` in `SessionMeta` too — store them.
+
+### 5. Frames from connections nobody accepted are refused
+
+With `$connect` running hooks (the default), a frame whose connection the store doesn't know is
+answered `403` and the socket is closed. Rolling from 2.x is safe: 2.x wrote a `META` row for every
+connection, so open sockets rehydrate with `client.data = {}` — guards that require identity refuse
+them, and the clients reconnect through the new `$connect`.
 
 ---
 
