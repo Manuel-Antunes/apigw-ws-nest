@@ -22,6 +22,8 @@ export interface Target {
   wsUrl: string;
   /** Emulator only. */
   httpUrl?: string;
+  /** Emulator only: the Nest HTTP platform the app runs on. */
+  httpPlatform?(): string;
   close(): Promise<void>;
 }
 
@@ -33,7 +35,12 @@ export async function startTarget(): Promise<Target> {
     verbose: false,
     platform: process.env.E2E_PLATFORM === 'fastify' ? 'fastify' : 'express',
   });
-  return { wsUrl: emulator.wsUrl, httpUrl: emulator.httpUrl, close: () => emulator.close() };
+  return {
+    wsUrl: emulator.wsUrl,
+    httpUrl: emulator.httpUrl,
+    httpPlatform: () => emulator.httpPlatform(),
+    close: () => emulator.close(),
+  };
 }
 
 /** POST /__reload: a brand-new Nest app + bridge over the same store. */

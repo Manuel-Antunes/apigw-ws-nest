@@ -62,6 +62,8 @@ export interface Emulator {
   wsUrl: string;
   /** http://localhost:<port> */
   httpUrl: string;
+  /** The Nest HTTP platform the current instance runs on. */
+  httpPlatform(): string;
   /** The durable store every "instance" shares — DynamoDB's stand-in. */
   store: InMemoryConnectionStore;
   /** A brand-new Nest app + bridge over the same store: a new "Lambda instance". */
@@ -342,6 +344,7 @@ export async function startEmulator(options: EmulatorOptions = {}): Promise<Emul
     httpUrl: `http://localhost:${port}`,
     store,
     reload,
+    httpPlatform: () => app!.getHttpAdapter().getType(),
     async close() {
       for (const socket of open.values()) socket.terminate();
       wss.close();

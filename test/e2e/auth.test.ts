@@ -34,6 +34,10 @@ afterAll(async () => {
 });
 
 describe('authentication at $connect', () => {
+  it.skipIf(REMOTE)('runs on the requested HTTP platform', () => {
+    expect(target.httpPlatform!()).toBe(process.env.E2E_PLATFORM === 'fastify' ? 'fastify' : 'express');
+  });
+
   it('refuses an invalid token with 401, at the handshake', async () => {
     expect(await open(target, '?token=bad')).toEqual({ refused: 401 });
   });
