@@ -4,7 +4,7 @@ All notable changes to `apigw-ws-nest`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## 3.0.0 — unreleased
+## 3.0.0 — 2026-10-09
 
 `$connect` becomes a decision: a connection can be refused with a status of your choosing, and the
 identity established there is persisted with the connection and rehydrated on every instance — so a
