@@ -68,6 +68,18 @@ export default defineConfig({
           fileParallelism: false,
         },
       },
+      {
+        // The same end-to-end suites, with the Nest app on Fastify.
+        extends: true,
+        test: {
+          name: 'e2e-fastify',
+          include: ['test/e2e/**/*.test.ts'],
+          env: { E2E_PLATFORM: 'fastify' },
+          testTimeout: 60_000,
+          hookTimeout: 60_000,
+          fileParallelism: false,
+        },
+      },
     ],
   },
 });

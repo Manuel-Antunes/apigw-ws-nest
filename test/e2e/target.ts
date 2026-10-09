@@ -28,7 +28,11 @@ export interface Target {
 export async function startTarget(): Promise<Target> {
   if (REMOTE) return { wsUrl: REMOTE, close: async () => {} };
   const { startEmulator } = await import('../../src/example/src/emulator');
-  const emulator = await startEmulator({ port: 0, verbose: false });
+  const emulator = await startEmulator({
+    port: 0,
+    verbose: false,
+    platform: process.env.E2E_PLATFORM === 'fastify' ? 'fastify' : 'express',
+  });
   return { wsUrl: emulator.wsUrl, httpUrl: emulator.httpUrl, close: () => emulator.close() };
 }
 

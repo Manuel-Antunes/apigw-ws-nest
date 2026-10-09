@@ -51,6 +51,9 @@ export interface EmulatorOptions {
   port?: number;
   /** Log instance rebuilds. Default true. */
   verbose?: boolean;
+  /** The Nest HTTP platform behind the app. Default 'express'. A factory, since
+   *  every "Lambda instance" (reload) needs a fresh adapter. */
+  platform?: "express" | "fastify";
 }
 
 export interface Emulator {
@@ -188,7 +191,12 @@ export async function startEmulator(options: EmulatorOptions = {}): Promise<Emul
     const next = GatewayBridge.builder().provider("local").store(store).build();
     // The adapter's defaults: $connect runs the gateways' handleConnection,
     // awaited, and there is no dispatch route — the emulator calls the bridge.
-    const nextApp = await createNestApp(AppModule, next);
+    const nextApp = await createNestApp(AppModule, next, {
+      httpAdapter:
+        options.platform === "fastify"
+          ? new (require("@nestjs/platform-fastify").FastifyAdapter)()
+          : undefined,
+    });
     await nextApp.init();
     // Re-registered against the NEW bridge, with the SAME registry and PubSub —
     // so subscriptions taken out before the reload still deliver after it.
